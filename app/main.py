@@ -10,9 +10,9 @@ from fastapi import Depends, FastAPI, HTTPException, Response
 from pydantic import ValidationError
 
 from .db import get_conn, init_db, utcnow
-from .rules import validate_report
+from .rules import find_infeasible_rounds, validate_report
 from .schemas import DeriveRequest, ProcedureCreate, ReviewRequest, TorqueReport
-from .sequencing import build_plan
+from .sequencing import build_plan, sequence_violations
 from .svg import render_svg
 
 STATUS_LABEL = {
@@ -133,6 +133,31 @@ def _progress_view(proc: dict, done: list[dict], plan: list[dict]) -> dict:
     }
 
 
+def _preflight(proc: dict) -> None:
+    """批准/开工前校验：交叉序列可实现，且每轮允许区间与工具量程有交集。"""
+    violations = sequence_violations(proc["bolt_count"])
+    if violations:
+        pairs = "、".join(f"{a}→{b}" for a, b in violations)
+        raise HTTPException(409, detail={
+            "reason": "sequence_not_realizable",
+            "message": f"{proc['bolt_count']} 栓法兰无法生成满足同轮非相邻规则的交叉序列"
+                       f"（相邻步骤：{pairs}），拒绝推进；请调整螺栓数量或工艺规则",
+            "adjacent_pairs": [list(p) for p in violations],
+        })
+    conflicts = find_infeasible_rounds(
+        proc["target_torque"], proc["stage_ratios"], proc["tolerance_pct"],
+        proc["tool_range_min"], proc["tool_range_max"])
+    if conflicts:
+        desc = "；".join(
+            f"第 {c['round_no']} 轮允许区间 {c['allowed_interval']} N·m "
+            f"与工具量程 {c['tool_range']} N·m 无交集" for c in conflicts)
+        raise HTTPException(409, detail={
+            "reason": "round_interval_infeasible",
+            "message": f"以下轮次任何回传都无法合格：{desc}",
+            "conflicts": conflicts,
+        })
+
+
 # ---------------------------------------------------------------- 工艺生命周期
 
 @app.post("/procedures", status_code=201)
@@ -182,13 +207,21 @@ def update_draft(pid: int, data: ProcedureCreate, conn: sqlite3.Connection = Dep
 
 @app.post("/procedures/{pid}/approve")
 def approve(pid: int, conn: sqlite3.Connection = Depends(get_db)):
-    """批准：锁定全部参数。"""
+    """批准：锁定全部参数；批准前校验序列可实现性与每轮可行区间。"""
+    proc = _fetch_proc(conn, pid)
+    if proc["status"] != "draft":
+        raise HTTPException(409, f"工艺 {pid} 当前状态 {proc['status']}，须为 draft 才能批准")
+    _preflight(proc)
     return {"procedure": _transition(conn, pid, "draft", "approved", "approved_at")}
 
 
 @app.post("/procedures/{pid}/start")
 def start(pid: int, conn: sqlite3.Connection = Depends(get_db)):
-    """开工。"""
+    """开工；开工前复核序列可实现性与每轮可行区间。"""
+    proc = _fetch_proc(conn, pid)
+    if proc["status"] != "approved":
+        raise HTTPException(409, f"工艺 {pid} 当前状态 {proc['status']}，须为 approved 才能开工")
+    _preflight(proc)
     return {"procedure": _transition(conn, pid, "approved", "in_progress", "started_at")}
 
 

@@ -29,6 +29,35 @@ class Rejection:
         }
 
 
+def find_infeasible_rounds(
+    target_torque: float,
+    stage_ratios: list[float],
+    tolerance_pct: float,
+    tool_range_min: float,
+    tool_range_max: float,
+) -> list[dict]:
+    """逐轮检查允许区间 [目标*(1-偏差), 目标*(1+偏差)] 与工具量程是否有交集。
+
+    无交集的轮次任何回传都不可能合格，须在批准前拒绝。返回冲突轮次列表。
+    """
+    conflicts: list[dict] = []
+    for round_no, ratio in enumerate(stage_ratios, start=1):
+        target = round(target_torque * ratio, 2)
+        lo = round(target * (1 - tolerance_pct / 100), 2)
+        hi = round(target * (1 + tolerance_pct / 100), 2)
+        if hi < tool_range_min or lo > tool_range_max:
+            conflicts.append(
+                {
+                    "round_no": round_no,
+                    "ratio": ratio,
+                    "target_torque": target,
+                    "allowed_interval": [lo, hi],
+                    "tool_range": [tool_range_min, tool_range_max],
+                }
+            )
+    return conflicts
+
+
 def _check_tolerance(proc: dict, report: TorqueReport, target: float) -> Rejection | None:
     dev_pct = abs(report.measured_torque - target) / target * 100
     if dev_pct > proc["tolerance_pct"]:
@@ -146,8 +175,8 @@ def validate_report(
             expected["bolt_no"],
         )
 
-    # 同轮连续紧固相邻螺栓（n=4 数学上不可避免，豁免）
-    if proc["bolt_count"] > 4 and done and done[-1]["round_no"] == current_round:
+    # 同轮连续紧固相邻螺栓（无豁免：4 栓配置在批准/开工前即被拒绝）
+    if done and done[-1]["round_no"] == current_round:
         prev_bolt = done[-1]["bolt_no"]
         if circular_distance(prev_bolt, report.bolt_no, proc["bolt_count"]) == 1:
             return Rejection(

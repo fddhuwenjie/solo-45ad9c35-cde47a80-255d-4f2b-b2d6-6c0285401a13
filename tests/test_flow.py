@@ -6,9 +6,9 @@ from fastapi.testclient import TestClient
 
 from app.db import init_db
 from app.main import app
-from app.rules import validate_report
+from app.rules import find_infeasible_rounds, validate_report
 from app.schemas import TorqueReport
-from app.sequencing import build_plan, circular_distance, cross_sequence
+from app.sequencing import build_plan, circular_distance, cross_sequence, sequence_violations
 
 BASE = {
     "flange_class": "PN40 DN200",
@@ -278,14 +278,77 @@ def test_invalid_inputs_rejected(client):
         assert r.status_code == 422, payload
 
 
-def test_four_bolt_flange_flow(client):
-    """4 栓法兰：相邻校验豁免，流程可走完。"""
-    pid = make_started(client, bolt_count=4)
-    for ratio in (0.3, 0.6, 1.0):
-        for bolt in [1, 3, 2, 4]:
-            r = report(client, pid, bolt, round(320.0 * ratio, 2))
-            assert r.status_code == 201, r.text
-    assert client.get(f"/procedures/{pid}").json()["procedure"]["status"] == "completed"
+def test_four_bolt_approve_rejected(client):
+    """4 栓无法生成全程非相邻序列（1-3-2-4 中 3→2 相邻），批准即拒绝并说明原因。"""
+    r = client.post("/procedures", json={**BASE, "bolt_count": 4})
+    assert r.status_code == 201  # 草稿可创建
+    pid = r.json()["procedure"]["id"]
+    r = client.post(f"/procedures/{pid}/approve")
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["reason"] == "sequence_not_realizable"
+    assert [3, 2] in detail["adjacent_pairs"]
+    assert "4 栓" in detail["message"]
+    # 状态保持草稿，无法开工
+    assert client.get(f"/procedures/{pid}").json()["procedure"]["status"] == "draft"
+    assert client.post(f"/procedures/{pid}/start").status_code == 409
+
+
+def test_sequence_violations():
+    assert sequence_violations(4) == [(3, 2)]
+    for n in (6, 8, 10, 12, 16, 20, 24):
+        assert sequence_violations(n) == []
+
+
+def test_adjacent_guard_applies_to_four_bolts():
+    """豁免已删除：4 栓序列中相邻的 3→2 在规则层同样被拒绝。"""
+    proc = {
+        "status": "in_progress", "bolt_count": 4, "tool_id": "T",
+        "calibration_valid_until": __import__("datetime").date(2026, 12, 31),
+        "tool_range_min": 0.0, "tool_range_max": 1000.0,
+        "target_torque": 100.0, "stage_ratios": [1.0], "tolerance_pct": 5.0,
+    }
+    plan = build_plan(4, 100.0, [1.0])  # 1-3-2-4
+    done = [{"round_no": 1, "bolt_no": 1}, {"round_no": 1, "bolt_no": 3}]
+    report = TorqueReport(bolt_no=2, tool_id="T", operator="x",
+                          reported_at="2026-09-12T09:00:00", measured_torque=100.0)
+    rej = validate_report(proc, plan, done, report)
+    assert rej is not None and rej.reason == "adjacent_in_round"
+
+
+def test_approve_rejects_infeasible_round(client):
+    """首轮允许区间 28.5~31.5 与量程 50~150 无交集：拒绝批准并指出冲突轮次。"""
+    payload = {**BASE, "target_torque": 100.0, "stage_ratios": [0.3, 1.0],
+               "tool_range_min": 50.0, "tool_range_max": 150.0}
+    r = client.post("/procedures", json=payload)
+    assert r.status_code == 201  # 目标扭矩在量程内，草稿可创建
+    pid = r.json()["procedure"]["id"]
+
+    r = client.post(f"/procedures/{pid}/approve")
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["reason"] == "round_interval_infeasible"
+    assert detail["conflicts"] == [{
+        "round_no": 1, "ratio": 0.3, "target_torque": 30.0,
+        "allowed_interval": [28.5, 31.5], "tool_range": [50.0, 150.0],
+    }]
+    assert "第 1 轮" in detail["message"]
+    # 只有第 1 轮冲突（第 2 轮 [95, 105] 与量程有交集）
+    assert len(detail["conflicts"]) == 1
+    # 保持草稿；修正量程后可批准、可开工
+    assert client.get(f"/procedures/{pid}").json()["procedure"]["status"] == "draft"
+    assert client.put(f"/procedures/{pid}",
+                      json={**payload, "tool_range_min": 20.0}).status_code == 200
+    assert client.post(f"/procedures/{pid}/approve").status_code == 200
+    assert client.post(f"/procedures/{pid}/start").status_code == 200
+
+
+def test_find_infeasible_rounds_unit():
+    # 区间上界恰好等于量程下限：有交集（单点），可行
+    assert find_infeasible_rounds(100.0, [0.5, 1.0], 5.0, 52.5, 150.0) == []
+    # 两轮都越界
+    conflicts = find_infeasible_rounds(100.0, [0.3, 1.0], 5.0, 110.0, 150.0)
+    assert [c["round_no"] for c in conflicts] == [1, 2]
 
 
 # ------------------------------------------------------------ 相邻守卫（规则层单测）

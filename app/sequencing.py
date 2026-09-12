@@ -2,8 +2,8 @@
 
 规则：n 个螺栓均布圆周，编号 1..n。顺序按"先对角、再顺移一位"展开：
     1, 1+n/2, 2, 2+n/2, 3, 3+n/2, ...
-保证 n >= 6 时同轮任意相邻两步在圆周上不相邻；n = 4 时数学上不可满足
-（C4 补图无哈密顿路径），采用经典 1-3-2-4 并豁免相邻校验。
+n >= 6 时同轮任意相邻两步在圆周上不相邻；n = 4 时数学上不可满足
+（C4 补图仅 1-3、2-4 两条边，无哈密顿路径），该配置在批准/开工前拒绝。
 """
 from __future__ import annotations
 
@@ -23,6 +23,15 @@ def circular_distance(a: int, b: int, n: int) -> int:
     """螺栓 a、b 在圆周上的最短间隔（1 表示相邻）。"""
     d = abs(a - b) % n
     return min(d, n - d)
+
+
+def sequence_violations(n: int) -> list[tuple[int, int]]:
+    """返回交叉序列中圆周相邻的连续步骤对；空列表表示满足同轮非相邻约束。
+
+    仅 n = 4 会出现违规（序列 1-3-2-4 中 3->2 相邻），用于批准/开工前拒绝该配置。
+    """
+    seq = cross_sequence(n)
+    return [(a, b) for a, b in zip(seq, seq[1:]) if circular_distance(a, b, n) == 1]
 
 
 def build_plan(bolt_count: int, target_torque: float, stage_ratios: list[float]) -> list[dict]:

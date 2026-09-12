@@ -29,7 +29,14 @@ FLANGE_DB=/path/to.db .venv/bin/uvicorn app.main:app
 
 紧固顺序：n 栓按 `1, 1+n/2, 2, 2+n/2, …` 交叉展开（8 栓为 1-5-2-6-3-7-4-8），
 每轮所有栓按该顺序拧到当轮比例。n≥6 时同轮相邻两步在圆周上必不相邻；
-n=4 数学上不可避免相邻，采用经典 1-3-2-4 并豁免相邻校验。
+n=4 数学上无法生成全程非相邻序列（1-3-2-4 中 3→2 相邻），该配置在批准/开工前拒绝。
+
+**批准/开工前校验**（不满足即 409 并说明原因）：
+
+- `sequence_not_realizable` — 交叉序列存在圆周相邻的连续步骤（仅 n=4 会触发），
+  返回相邻步骤对；
+- `round_interval_infeasible` — 某轮允许区间 `[目标×(1±偏差)]` 与工具量程无交集，
+  任何回传都无法合格，返回冲突轮次、允许区间与量程。
 
 ## 回传校验（POST /procedures/{id}/reports）
 
@@ -41,7 +48,7 @@ n=4 数学上不可避免相邻，采用经典 1-3-2-4 并豁免相邻校验。
 | `tool_out_of_range` | 实测扭矩超出工具量程 |
 | `tool_mismatch` | 回传工具与批准版本锁定工具不符 |
 | `out_of_sequence` | 跳步，返回期望栓号 |
-| `adjacent_in_round` | 同轮连续紧固相邻螺栓 |
+| `adjacent_in_round` | 同轮连续紧固相邻螺栓（无豁免） |
 | `torque_out_of_tolerance` | 扭矩超差 |
 | `duplicate_in_round` | 同一螺栓本轮已有记录 |
 | `not_started` / `not_in_progress` / `already_complete` / `archived` | 状态不允许 |
