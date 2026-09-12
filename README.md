@@ -10,7 +10,7 @@ Python + FastAPI 接收请求，Pydantic 核验字段，工艺与执行版本写
 python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/uvicorn app.main:app --reload          # 默认库文件 ./flange.db
 FLANGE_DB=/path/to.db .venv/bin/uvicorn app.main:app
-.venv/bin/python -m pytest tests/ -q             # 52 个测试
+.venv/bin/python -m pytest tests/ -q             # 123 个测试
 ```
 
 ## 输入项（POST /procedures）
@@ -33,10 +33,69 @@ n=4 数学上无法生成全程非相邻序列（1-3-2-4 中 3→2 相邻），�
 
 **批准/开工前校验**（不满足即 409 并说明原因）：
 
+- `alignment_check_missing` / `alignment_check_not_passed` — 缺对中预检，
+  或采用的预检版本未通过（证据缺口/阻断项，见下节）；
 - `sequence_not_realizable` — 交叉序列存在圆周相邻的连续步骤（仅 n=4 会触发），
   返回相邻步骤对；
 - `round_interval_infeasible` — 某轮允许区间 `[目标×(1±偏差)]` 与工具量程无交集，
   任何回传都无法合格，返回冲突轮次、允许区间与量程。
+
+## 装配对中预检（紧固前自由状态）
+
+两片法兰在螺栓尚未受力时若已被强行拉拢，终拧扭矩和超声预紧力都可能合格，
+管口附加应力、垫片偏心却不会从既有记录中暴露。因此在批准/开工门禁前增加
+**装配对中预检**：几何与限值逐版冻结写入 SQLite，计算与路由沿用 Python + FastAPI。
+
+`POST /procedures/{id}/alignment-checks`（仅 draft/approved，即螺栓受力拉拢之前）
+冻结以下参数（冻结后只能另存新版本）：
+
+| 字段 | 说明 |
+|---|---|
+| `flange_face_diameter_mm` | 法兰面（密封面）外径 D |
+| `gasket_inner_diameter_mm` / `gasket_outer_diameter_mm` | 垫片内径 Gi / 外径 Go |
+| `bore_diameter_mm` | 法兰内孔（流道）直径 Db |
+| `max_parallelism_mm` | 平行度（最大−最小间隙）限值 |
+| `max_radial_mismatch_mm` | 径向错边限值 |
+
+每版接收 **≥4 个按方位分布**的测点（`angle_deg` 0=正上方、顺时针为正，
+与编号方位一致），每点含 `axial_gap`（轴向间隙）、`radial_offset`
+（径向偏移，沿 u 方向带符号）、`gasket_edge_position`（自法兰外缘向内量到
+垫片外缘）、`bolt_free_insertion`（螺栓能否在法兰不受力时自由穿入），
+线值单位按点声明（`mm`/`cm`/`m`/`in`，默认 mm）。
+
+服务最小二乘拟合两法兰面相对倾斜 `gap=c+a·u`、径向偏移向量与垫片偏心，
+输出最大/最小间隙（拟合全周极值）、平行度、倾角及方位、径向错边与跳动 TIR、
+垫片偏心/方位与**流道侧、法兰面侧居中余量**（余量按测点边缘极值，属最坏方位的
+直接证据），并附三个拟合残差 RMS 供核对。
+
+**证据缺口（只列证据，不产出指标，更不判合格）**——版本照常落库（201），
+但 `evaluable=false`、`metrics=null`，阻止批准/开工：
+
+| reason | 含义 |
+|---|---|
+| `duplicate_azimuth` | 测点方位重复（记录重复方位，非请求级拒绝） |
+| `insufficient_arc_coverage` | 最大空弧 >180°，测点全落在半圆内 |
+| `inconsistent_units` | 测点之间长度单位不一致 |
+| `negative_axial_gap` | 轴向间隙为负（自由状态两面不应交叠） |
+| `gasket_outside_face` | 垫片边缘越出法兰面 / 内缘越过对侧边 |
+| `radial_offset_impossible` | 径向偏移绝对值超过法兰面半径 |
+
+**阻断项**（证据充分但几何超限）：
+
+| reason | 含义 |
+|---|---|
+| `parallelism_exceeded` | 平行度超冻结限值 |
+| `radial_mismatch_exceeded` | 径向错边超冻结限值 |
+| `gasket_intrusion` | 垫片内缘侵入流道（流道侧居中余量 <0） |
+| `forced_pull_required` | 任一螺栓不能自由穿入，或拟合全周最小间隙 ≤0（已局部接触，须强行拉拢） |
+
+**复测留痕**：第 2 版及以后必须填 `adjustment_reason`（注明调整原因），
+旧版本永久保留不可覆盖；首版携带该字段返回 422。版本清单
+`GET /procedures/{id}/alignment-checks`，版本详情 `GET /alignment-checks/{cid}`，
+版本差异 `GET /alignment-checks/{cid}/diff`（冻结几何、按方位 ±5° 匹配的测点
+变化与拟合指标变化）。作业包 `alignment` 字段与圆周 SVG 共用**同一采用版本
+（最新版）与同一批测点**：图上法兰圆外菱形为测点（红=缺口/螺栓不能穿入），
+虚线指示最大倾斜方位，并列出平行度、错边、垫片偏心与两侧余量。
 
 ## 回传校验（POST /procedures/{id}/reports）
 
@@ -133,22 +192,24 @@ n=4 数学上无法生成全程非相邻序列（1-3-2-4 中 3→2 相邻），�
 
 ## 作业包与图示
 
-- `GET /procedures/{id}/package` — JSON 作业包：计划、实测、异常、修订链
-- `GET /procedures/{id}/diagram.svg` — 圆周示意：方位、完成轮次、下一栓、异常红圈、补拧 R 标记
-- `samples/` — 正常、跳步、过期工具三个请求样例（见 `samples/README.md`）
+- `GET /procedures/{id}/package` — JSON 作业包：计划、实测、异常、修订链、对中预检采用版本
+- `GET /procedures/{id}/diagram.svg` — 圆周示意：对中测点与倾斜方位、螺栓、完成轮次、下一栓、异常红圈、补拧 R 标记
+- `samples/` — 正常、跳步、过期工具与对中预检/复测请求样例（见 `samples/README.md`）
 
 ## 代码结构
 
 ```
 app/
-  schemas.py     Pydantic 输入核验（工艺 + 超声批次/基线/复测/重测/排除）
+  schemas.py     Pydantic 输入核验（工艺 + 超声 + 对中预检 + 轨迹）
   sequencing.py  交叉顺序与分轮计划（支持补拧锁定螺栓过滤）
+  alignment.py   间隙面/径向/垫片偏心最小二乘拟合、证据缺口、阻断项、版本差异（纯函数）
   rules.py       回传校验规则（纯函数）
   ultrasonic.py  时差->伸长->预紧力换算、证据缺口、离散度与对径不平衡（纯函数）
-  db.py          SQLite 模式与连接（批次/基线/读数/缺口/补拧作业）
-  svg.py         圆周示意 SVG（含超声复核层）
+  db.py          SQLite 模式与连接（预检版本/测点、批次/基线/读数/缺口/补拧作业）
+  svg.py         圆周示意 SVG（含对中预检层与超声复核层）
   main.py        FastAPI 路由与状态机
 tests/test_flow.py       扭矩全流程与各类拒绝场景
+tests/test_alignment.py  对中拟合、证据缺口、阻断项、复测留痕、门禁、版本差异
 tests/test_ultrasonic.py 超声复核、证据缺口、重测排除、补拧派生
 samples/                 请求样例
 ```

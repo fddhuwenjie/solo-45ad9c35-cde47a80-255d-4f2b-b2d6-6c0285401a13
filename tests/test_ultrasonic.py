@@ -32,6 +32,29 @@ BASE = {
 }
 SEQ8 = [1, 5, 2, 6, 3, 7, 4, 8]
 
+# 对中预检冻结几何（PN40 DN200 示例）
+ALIGN_GEOM = {
+    "flange_face_diameter_mm": 285.0,
+    "gasket_inner_diameter_mm": 220.0,
+    "gasket_outer_diameter_mm": 270.0,
+    "bore_diameter_mm": 200.0,
+    "max_parallelism_mm": 1.0,
+    "max_radial_mismatch_mm": 2.0,
+}
+EDGE0 = (285.0 - 270.0) / 2.0
+
+
+def submit_alignment(client, pid):
+    """提交一次通过的 8 方位对中预检（均匀 2mm 间隙、完全对中）。"""
+    points = [{"angle_deg": a, "axial_gap": 2.0, "radial_offset": 0.0,
+               "gasket_edge_position": EDGE0, "bolt_free_insertion": True}
+              for a in (0, 45, 90, 135, 180, 225, 270, 315)]
+    r = client.post(f"/procedures/{pid}/alignment-checks",
+                    json={**ALIGN_GEOM, "points": points, "operator": "预检员",
+                          "measured_at": "2026-09-12T08:00:00"})
+    assert r.status_code == 201, r.text
+    return r.json()["alignment_check"]
+
 # 冻结参数
 L_MM = 150.0
 AREA = 353.0
@@ -77,6 +100,7 @@ def client(tmp_path, monkeypatch):
 def make_approved(client) -> int:
     r = client.post("/procedures", json=BASE)
     pid = r.json()["procedure"]["id"]
+    submit_alignment(client, pid)
     assert client.post(f"/procedures/{pid}/approve").status_code == 200
     return pid
 
@@ -412,6 +436,7 @@ def test_failed_batch_derives_rework_locking_good_bolts(client):
     assert client.get(f"/measurement-batches/{bid}").json()["batch"]["status"] == "superseded"
 
     # 锁定栓回传被拒
+    submit_alignment(client, rw_pid)
     assert client.post(f"/procedures/{rw_pid}/approve").status_code == 200
     r = client.post(f"/procedures/{rw_pid}/start")
     assert r.status_code == 200
@@ -634,6 +659,7 @@ def test_imbalance_picks_lower_bolt_and_full_rework_chain(client):
     assert r.json()["target_bolts"] == [2]
 
     rw_pid = r.json()["rework_procedure"]["id"]
+    submit_alignment(client, rw_pid)
     client.post(f"/procedures/{rw_pid}/approve")
     client.post(f"/procedures/{rw_pid}/start")
 

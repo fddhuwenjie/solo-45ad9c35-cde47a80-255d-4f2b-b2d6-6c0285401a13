@@ -4,9 +4,11 @@
 交叉顺序为 1-5-2-6-3-7-4-8，校准有效期至 2026-12-31）。
 
 ```bash
-# 1. 创建 -> 批准 -> 开工
+# 1. 创建 -> 对中预检 -> 批准 -> 开工
 curl -X POST localhost:8000/procedures -H 'Content-Type: application/json' \
      -d @samples/create_procedure.json          # 返回 {"procedure": {"id": 1, ...}, "plan": [...]}
+curl -X POST localhost:8000/procedures/1/alignment-checks \
+     -H 'Content-Type: application/json' -d @samples/alignment_check.json
 curl -X POST localhost:8000/procedures/1/approve
 curl -X POST localhost:8000/procedures/1/start
 
@@ -62,3 +64,26 @@ curl -X POST localhost:8000/measurement-batches/1/derive-rework
 
 作业包 `GET /procedures/1/package` 的 `measurement` 字段与 SVG
 （绿/橙环 + 每栓 kN 载荷）引用同一测量批次与修订号。
+
+## 装配对中预检样例（批准/开工前）
+
+两片法兰在螺栓尚未受力时若已被强行拉拢，终拧扭矩与超声预紧力都可能合格，
+管口应力与垫片偏心却无记录。预检在批准前完成，首版不带调整原因：
+
+```bash
+# 首版（8 方位测点，冻结法兰面直径/垫片内外径/内孔直径/平行度与错边限值）
+curl -X POST localhost:8000/procedures/1/alignment-checks \
+     -H 'Content-Type: application/json' -d @samples/alignment_check.json
+
+# 调整后复测：必须另存版本并注明调整原因，旧记录不覆盖
+curl -X POST localhost:8000/procedures/1/alignment-checks \
+     -H 'Content-Type: application/json' -d @samples/alignment_recheck.json
+
+curl localhost:8000/procedures/1/alignment-checks      # 全部版本
+curl localhost:8000/alignment-checks/2                 # v2 详情（冻结+测点+结论）
+curl localhost:8000/alignment-checks/2/diff            # v1->v2 差异（按方位匹配测点）
+```
+
+作业包 `alignment` 字段与圆周 SVG（法兰圆外菱形测点、相对倾斜虚线、
+平行度/错边/垫片偏心指标）引用同一采用版本（最新版）。
+

@@ -36,6 +36,27 @@ BASE = {
 }
 SEQ8 = [1, 5, 2, 6, 3, 7, 4, 8]
 
+ALIGN_GEOM = {
+    "flange_face_diameter_mm": 285.0,
+    "gasket_inner_diameter_mm": 220.0,
+    "gasket_outer_diameter_mm": 270.0,
+    "bore_diameter_mm": 200.0,
+    "max_parallelism_mm": 1.0,
+    "max_radial_mismatch_mm": 2.0,
+}
+EDGE0 = (285.0 - 270.0) / 2.0
+
+
+def submit_alignment(client, pid):
+    points = [{"angle_deg": a, "axial_gap": 2.0, "radial_offset": 0.0,
+               "gasket_edge_position": EDGE0, "bolt_free_insertion": True}
+              for a in (0, 45, 90, 135, 180, 225, 270, 315)]
+    r = client.post(f"/procedures/{pid}/alignment-checks",
+                    json={**ALIGN_GEOM, "points": points, "operator": "预检员",
+                          "measured_at": "2026-09-12T08:00:00"})
+    assert r.status_code == 201, r.text
+    return r.json()["alignment_check"]
+
 # 纯函数分析用工艺参数（与 BASE 锁定值一致）
 PROC = {k: BASE[k] for k in (
     "curve_direction", "snug_torque", "post_snug_angle_min_deg",
@@ -65,6 +86,7 @@ def make_completed(client, **overrides) -> int:
     r = client.post("/procedures", json={**BASE, **overrides})
     assert r.status_code == 201, r.text
     pid = r.json()["procedure"]["id"]
+    submit_alignment(client, pid)
     assert client.post(f"/procedures/{pid}/approve").status_code == 200
     assert client.post(f"/procedures/{pid}/start").status_code == 200
     for ratio in (0.3, 0.6, 1.0):
@@ -320,6 +342,7 @@ def test_curve_requires_final_round_record(client):
 def test_curve_window_closed(client):
     r = client.post("/procedures", json=BASE)
     pid = r.json()["procedure"]["id"]
+    submit_alignment(client, pid)
     client.post(f"/procedures/{pid}/approve")
     r = submit(client, pid, 1, good_curve())  # approved 状态不可提交
     assert r.status_code == 409

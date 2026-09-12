@@ -1,0 +1,20 @@
+{
+  "flange_face_diameter_mm": 285.0,
+  "gasket_inner_diameter_mm": 220.0,
+  "gasket_outer_diameter_mm": 270.0,
+  "bore_diameter_mm": 200.0,
+  "max_parallelism_mm": 1.0,
+  "max_radial_mismatch_mm": 2.0,
+  "points": [
+    {"angle_deg": 0,    "axial_gap": 2.0, "radial_offset": 0.0, "gasket_edge_position": 7.5, "bolt_free_insertion": true},
+    {"angle_deg": 45,   "axial_gap": 2.0, "radial_offset": 0.0, "gasket_edge_position": 7.5, "bolt_free_insertion": true},
+    {"angle_deg": 90,   "axial_gap": 2.0, "radial_offset": 0.0, "gasket_edge_position": 7.5, "bolt_free_insertion": true},
+    {"angle_deg": 135,  "axial_gap": 2.0, "radial_offset": 0.0, "gasket_edge_position": 7.5, "bolt_free_insertion": true},
+    {"angle_deg": 180,  "axial_gap": 2.0, "radial_offset": 0.0, "gasket_edge_position": 7.5, "bolt_free_insertion": true},
+    {"angle_deg": 225,  "axial_gap": 2.0, "radial_offset": 0.0, "gasket_edge_position": 7.5, "bolt_free_insertion": true},
+    {"angle_deg": 270,  "axial_gap": 2.0, "radial_offset": 0.0, "gasket_edge_position": 7.5, "bolt_free_insertion": true},
+    {"angle_deg": 315,  "axial_gap": 2.0, "radial_offset": 0.0, "gasket_edge_position": 7.5, "bolt_free_insertion": true}
+  ],
+  "operator": "预检员",
+  "measured_at": "2026-09-12T08:00:00"
+}

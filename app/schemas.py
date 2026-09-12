@@ -218,3 +218,56 @@ class CurveAmend(BaseModel):
     angle_unit: AngleUnit | None = Field(None, description="新轨迹角度单位；缺省沿用原单位")
     snug_index: int | None = Field(None, ge=0, description="人工贴合点（采样点索引）；缺省自动定位")
     record_id: int | None = Field(None, ge=1, description="重新关联的终轮记录 id；缺省不变")
+
+
+# ---------------------------------------------------------------- 装配对中预检
+
+LengthUnit = Literal["mm", "cm", "m", "in"]
+
+
+class AlignmentPoint(BaseModel):
+    """一个按方位分布的对中测点（轴向间隙、径向偏移、垫片边缘位置与螺栓穿入结果）。
+
+    angle_deg：测点方位角，0 为正上方、顺时针为正（与编号方位一致），允许任意
+    实数，落库前归一化到 [0,360)。三个线值共用 length_unit（默认 mm）；各测点
+    单位不一致不做请求级拒绝，作为证据缺口在预检结论中列出。
+    """
+
+    angle_deg: float = Field(..., description="测点方位角（0=正上方，顺时针为正）")
+    axial_gap: float = Field(..., description="该方位两法兰面轴向间隙（自由状态，可为负以暴露矛盾读数）")
+    radial_offset: float = Field(..., description="该方位径向偏移读数（正=活动面向外偏，沿 u 方向）")
+    gasket_edge_position: float = Field(
+        ..., description="该方位自法兰外缘向内量到垫片外缘的距离（≥0）")
+    bolt_free_insertion: bool = Field(
+        ..., description="该方位螺栓是否可在法兰不受力状态下自由穿入")
+    length_unit: LengthUnit = Field("mm", description="本测点三个线值的长度单位")
+
+
+class AlignmentCheckCreate(BaseModel):
+    """装配对中预检建版：冻结法兰/垫片几何与限值，并接收 >=4 个按方位测点。
+
+    每个版本不可变；调整后复测必须另存新版本并注明调整原因，旧记录不覆盖。
+    """
+
+    flange_face_diameter_mm: float = Field(..., gt=0, description="法兰面（密封面）外径 D（mm）")
+    gasket_inner_diameter_mm: float = Field(..., gt=0, description="垫片内径 Gi（mm）")
+    gasket_outer_diameter_mm: float = Field(..., gt=0, description="垫片外径 Go（mm）")
+    bore_diameter_mm: float = Field(..., gt=0, description="法兰内孔（流道）直径 Db（mm）")
+    max_parallelism_mm: float = Field(..., gt=0, description="平行度（最大-最小间隙）限值（mm）")
+    max_radial_mismatch_mm: float = Field(..., gt=0, description="径向错边限值（mm）")
+    points: list[AlignmentPoint] = Field(..., min_length=4, description=">=4 个按方位分布的测点")
+    operator: str = Field(..., min_length=1, description="测量操作者")
+    measured_at: datetime = Field(..., description="测量时刻 ISO 8601")
+    adjustment_reason: str | None = Field(
+        None, description="复测调整原因；首版必须为空，第 2 版及以后必填（旧版本不覆盖）")
+
+    @model_validator(mode="after")
+    def _check_geometry(self) -> "AlignmentCheckCreate":
+        if self.gasket_inner_diameter_mm >= self.gasket_outer_diameter_mm:
+            raise ValueError("垫片外径须大于内径")
+        if self.gasket_outer_diameter_mm > self.flange_face_diameter_mm:
+            raise ValueError("垫片外径不得大于法兰面直径")
+        if self.bore_diameter_mm > self.flange_face_diameter_mm:
+            raise ValueError("法兰内孔直径不得大于法兰面直径")
+        # 方位重复、几何自相矛盾不作为请求级拒绝：版本照常冻结并在结论中只列证据缺口
+        return self

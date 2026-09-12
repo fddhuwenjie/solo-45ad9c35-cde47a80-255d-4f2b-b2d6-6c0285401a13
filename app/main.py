@@ -9,12 +9,14 @@ from datetime import date, datetime
 from fastapi import Depends, FastAPI, HTTPException, Response
 from pydantic import ValidationError
 
+from .alignment import analyze_alignment, diff_analyses
 from .curve import analyze_curve, evaluate_curve_review
 from .db import get_conn, init_db, utcnow
 from .rules import find_infeasible_rounds, validate_report
-from .schemas import (BaselineRequest, CurveAmend, CurveSubmit, DeriveRequest,
-                      ExcludeRequest, MeasurementBatchCreate, RemeasurementRequest,
-                      RetestRequest, ProcedureCreate, ReviewRequest, TorqueReport)
+from .schemas import (AlignmentCheckCreate, BaselineRequest, CurveAmend, CurveSubmit,
+                      DeriveRequest, ExcludeRequest, MeasurementBatchCreate,
+                      RemeasurementRequest, RetestRequest, ProcedureCreate, ReviewRequest,
+                      TorqueReport)
 from .sequencing import build_plan, sequence_violations
 from .svg import render_svg
 from .ultrasonic import GAP_MESSAGES, evaluate_batch, evaluate_reading
@@ -198,6 +200,90 @@ def _preflight(conn: sqlite3.Connection, proc: dict) -> None:
             "message": f"以下轮次任何回传都无法合格：{desc}",
             "conflicts": conflicts,
         })
+    alignment_gate = _alignment_gate(conn, proc)
+    if alignment_gate is not None:
+        raise HTTPException(409, detail=alignment_gate)
+
+
+# ---------------------------------------------------------------- 装配对中预检
+
+# 预检建版窗口：工艺参数已冻结但尚未拉拢紧固
+ALIGNMENT_STATUSES = ("draft", "approved")
+ALIGNMENT_FROZEN_FIELDS = (
+    "flange_face_diameter_mm", "gasket_inner_diameter_mm",
+    "gasket_outer_diameter_mm", "bore_diameter_mm",
+    "max_parallelism_mm", "max_radial_mismatch_mm",
+)
+
+
+def _check_points(conn: sqlite3.Connection, check_id: int) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM alignment_points WHERE check_id=? ORDER BY id", (check_id,)
+    ).fetchall()
+    return [{
+        "angle_deg": r["angle_deg"], "axial_gap": r["axial_gap"],
+        "radial_offset": r["radial_offset"],
+        "gasket_edge_position": r["gasket_edge_position"],
+        "bolt_free_insertion": bool(r["bolt_free_insertion"]),
+        "length_unit": r["length_unit"],
+    } for r in rows]
+
+
+def _check_view(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    return {
+        "check_id": row["id"], "procedure_id": row["procedure_id"],
+        "version": row["version"],
+        "frozen": {f: row[f] for f in ALIGNMENT_FROZEN_FIELDS},
+        "operator": row["operator"], "measured_at": row["measured_at"],
+        "adjustment_reason": row["adjustment_reason"],
+        "created_at": row["created_at"],
+        "analysis": json.loads(row["analysis"]),
+    }
+
+
+def _list_alignment_checks(conn: sqlite3.Connection, pid: int) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM alignment_checks WHERE procedure_id=? ORDER BY version", (pid,)
+    ).fetchall()
+    return [_check_view(conn, r) for r in rows]
+
+
+def _adopted_alignment(conn: sqlite3.Connection, pid: int) -> dict | None:
+    """作业包与圆周 SVG 共用的预检版本：最新版本（旧版本永不覆盖）。"""
+    checks = _list_alignment_checks(conn, pid)
+    return checks[-1] if checks else None
+
+
+def _alignment_gate(conn: sqlite3.Connection, proc: dict) -> dict | None:
+    """批准/开工门禁：采用最新预检版本；缺失或未通过即阻断。"""
+    checks = _list_alignment_checks(conn, proc["id"])
+    if not checks:
+        return {
+            "reason": "alignment_check_missing",
+            "message": f"工艺 {proc['id']} 尚无装配对中预检；须在批准前提交 >=4 个"
+                       "按方位分布的测点（轴向间隙、径向偏移、垫片边缘位置、螺栓自由穿入）",
+        }
+    latest = checks[-1]
+    analysis = latest["analysis"]
+    if analysis["passed"]:
+        return None
+    gaps = [f'{g["reason"]}@{g["angle_deg"]}°' if g["angle_deg"] is not None
+            else g["reason"] for g in analysis["evidence_gaps"]]
+    blockers = [b["reason"] for b in analysis["blockers"]]
+    parts: list[str] = []
+    if gaps:
+        parts.append("证据缺口：" + "、".join(gaps))
+    if blockers:
+        parts.append("阻断项：" + "、".join(blockers))
+    return {
+        "reason": "alignment_check_not_passed",
+        "message": f"装配对中预检 v{latest['version']} 未通过；" + "；".join(parts)
+                   + "。调整后须复测并注明调整原因（另存新版本，旧记录不覆盖）",
+        "alignment_check_id": latest["check_id"],
+        "version": latest["version"],
+        "evidence_gaps": analysis["evidence_gaps"],
+        "blockers": analysis["blockers"],
+    }
 
 
 # ---------------------------------------------------------------- 工艺生命周期
@@ -616,6 +702,109 @@ def amend_curve(cid: int, body: CurveAmend, conn: sqlite3.Connection = Depends(g
     }
 
 
+# ---------------------------------------------------------------- 装配对中预检路由
+
+@app.post("/procedures/{pid}/alignment-checks", status_code=201)
+def create_alignment_check(pid: int, body: AlignmentCheckCreate,
+                           conn: sqlite3.Connection = Depends(get_db)):
+    """提交装配对中预检：冻结几何与限值，拟合相对倾斜/错边/垫片对中。
+
+    每个版本不可变；复测必须注明调整原因并另存新版本（version+1），旧记录保留。
+    结论含证据缺口或阻断项时版本照常落库，但阻止工艺批准与开工。
+    """
+    proc = _fetch_proc(conn, pid)
+    if proc["status"] not in ALIGNMENT_STATUSES:
+        raise HTTPException(409, detail={
+            "reason": "alignment_window_closed",
+            "message": f"工艺状态 {proc['status']}：对中预检仅在 draft/approved 阶段"
+                       "（螺栓尚未受力拉拢之前）提交；开工后发现对中问题须派生新工艺",
+        })
+    existing = conn.execute(
+        "SELECT COUNT(*) c FROM alignment_checks WHERE procedure_id=?", (pid,)
+    ).fetchone()["c"]
+    next_version = existing + 1
+    if next_version == 1 and body.adjustment_reason is not None:
+        raise HTTPException(422, detail={
+            "reason": "adjustment_reason_on_first_version",
+            "message": "首个预检版本无旧版本可调整，adjustment_reason 必须为空",
+        })
+    if next_version >= 2 and not (body.adjustment_reason or "").strip():
+        raise HTTPException(422, detail={
+            "reason": "adjustment_reason_required",
+            "message": f"复测另存为 v{next_version}，必须注明调整原因（旧版本保留不可覆盖）",
+        })
+
+    frozen = {f: getattr(body, f) for f in ALIGNMENT_FROZEN_FIELDS}
+    points = [p.model_dump() for p in body.points]
+    analysis = analyze_alignment(frozen, points)
+
+    cur = conn.execute(
+        """INSERT INTO alignment_checks
+           (procedure_id, version, flange_face_diameter_mm, gasket_inner_diameter_mm,
+            gasket_outer_diameter_mm, bore_diameter_mm, max_parallelism_mm,
+            max_radial_mismatch_mm, operator, measured_at, adjustment_reason,
+            analysis, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (pid, next_version, body.flange_face_diameter_mm, body.gasket_inner_diameter_mm,
+         body.gasket_outer_diameter_mm, body.bore_diameter_mm, body.max_parallelism_mm,
+         body.max_radial_mismatch_mm, body.operator, body.measured_at.isoformat(),
+         body.adjustment_reason, json.dumps(analysis), utcnow()),
+    )
+    check_id = cur.lastrowid
+    for p in body.points:
+        conn.execute(
+            """INSERT INTO alignment_points
+               (check_id, angle_deg, axial_gap, radial_offset, gasket_edge_position,
+                bolt_free_insertion, length_unit)
+               VALUES (?,?,?,?,?,?,?)""",
+            (check_id, p.angle_deg % 360.0, p.axial_gap, p.radial_offset,
+             p.gasket_edge_position, int(p.bolt_free_insertion), p.length_unit),
+        )
+    conn.commit()
+    row = conn.execute("SELECT * FROM alignment_checks WHERE id=?", (check_id,)).fetchone()
+    return {"alignment_check": _check_view(conn, row)}
+
+
+@app.get("/procedures/{pid}/alignment-checks")
+def list_alignment_checks(pid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """列出全部预检版本（旧版本不可覆盖，逐版保留）。"""
+    _fetch_proc(conn, pid)
+    return {"procedure_id": pid, "alignment_checks": _list_alignment_checks(conn, pid)}
+
+
+@app.get("/alignment-checks/{cid}")
+def get_alignment_check(cid: int, conn: sqlite3.Connection = Depends(get_db)):
+    row = conn.execute("SELECT * FROM alignment_checks WHERE id=?", (cid,)).fetchone()
+    if row is None:
+        raise HTTPException(404, f"对中预检 {cid} 不存在")
+    view = _check_view(conn, row)
+    view["points"] = _check_points(conn, cid)
+    return view
+
+
+@app.get("/alignment-checks/{cid}/diff")
+def alignment_check_diff(cid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """与上一版本的差异：冻结几何、按方位匹配的测点与拟合指标变化。"""
+    row = conn.execute("SELECT * FROM alignment_checks WHERE id=?", (cid,)).fetchone()
+    if row is None:
+        raise HTTPException(404, f"对中预检 {cid} 不存在")
+    if row["version"] <= 1:
+        raise HTTPException(409, detail={
+            "reason": "no_previous_alignment_version",
+            "message": f"预检 v{row['version']} 为首版，无历史版本可对比",
+        })
+    prev = conn.execute(
+        "SELECT * FROM alignment_checks WHERE procedure_id=? AND version=?",
+        (row["procedure_id"], row["version"] - 1)).fetchone()
+    return {
+        "procedure_id": row["procedure_id"],
+        "from_check_id": prev["id"], "to_check_id": cid,
+        "from_version": prev["version"], "to_version": row["version"],
+        "adjustment_reason": row["adjustment_reason"],
+        "diff": diff_analyses(json.loads(prev["analysis"]), json.loads(row["analysis"])),
+    }
+
+
 # ---------------------------------------------------------------- 作业包与图示
 
 def _revision_chain(conn: sqlite3.Connection, pid: int) -> dict:
@@ -647,6 +836,7 @@ def job_package(pid: int, conn: sqlite3.Connection = Depends(get_db)):
     anomalies = [dict(r) for r in conn.execute(
         "SELECT * FROM anomalies WHERE procedure_id=? ORDER BY id", (pid,)).fetchall()]
     done = [r for r in records if r["rework_of"] is None]
+    alignment = _adopted_alignment(conn, pid)
     return {
         "procedure": proc,
         "progress": _progress_view(proc, done, plan),
@@ -654,6 +844,7 @@ def job_package(pid: int, conn: sqlite3.Connection = Depends(get_db)):
         "records": records,
         "anomalies": anomalies,
         "revisions": _revision_chain(conn, pid),
+        "alignment": alignment,
         "measurement": _measurement_reference(conn, pid),
         "curves": _curve_review(conn, proc),
         "generated_at": utcnow(),
@@ -670,9 +861,11 @@ def diagram(pid: int, conn: sqlite3.Connection = Depends(get_db)):
         "SELECT bolt_no FROM anomalies WHERE procedure_id=?", (pid,)).fetchall()]
     done = [r for r in records if r["rework_of"] is None]
     next_step = plan[len(done)] if len(done) < len(plan) else None
+    alignment = _adopted_alignment(conn, pid)
     measurement = _measurement_reference(conn, pid)
     curves = _curve_review(conn, proc)
-    svg = render_svg(proc, plan, records, anomalies, next_step, measurement, curves)
+    svg = render_svg(proc, plan, records, anomalies, next_step, measurement, curves,
+                     alignment)
     return Response(content=svg, media_type="image/svg+xml")
 
 

@@ -34,6 +34,47 @@ BASE = {
 
 SEQ8 = [1, 5, 2, 6, 3, 7, 4, 8]  # 8 栓交叉顺序
 
+# 对中预检冻结几何（PN40 DN200 示例）
+ALIGN_GEOM = {
+    "flange_face_diameter_mm": 285.0,
+    "gasket_inner_diameter_mm": 220.0,
+    "gasket_outer_diameter_mm": 270.0,
+    "bore_diameter_mm": 200.0,
+    "max_parallelism_mm": 1.0,
+    "max_radial_mismatch_mm": 2.0,
+}
+# 法兰外缘向内到垫片外缘的同心距离 (D-Go)/2
+EDGE0 = (ALIGN_GEOM["flange_face_diameter_mm"]
+         - ALIGN_GEOM["gasket_outer_diameter_mm"]) / 2.0
+
+
+def alignment_payload(*, angles=(0, 45, 90, 135, 180, 225, 270, 315),
+                      gaps=None, offsets=None, edges=None, free=None,
+                      adjustment_reason=None, units=None):
+    """构造一次通过预检的测点（默认 8 方位、均匀 2mm 间隙、完全对中）。"""
+    pts = []
+    for i, ang in enumerate(angles):
+        pts.append({
+            "angle_deg": ang,
+            "axial_gap": 2.0 if gaps is None else gaps[i],
+            "radial_offset": 0.0 if offsets is None else offsets[i],
+            "gasket_edge_position": EDGE0 if edges is None else edges[i],
+            "bolt_free_insertion": True if free is None else free[i],
+            "length_unit": "mm" if units is None else units[i],
+        })
+    body = {**ALIGN_GEOM, "points": pts, "operator": "预检员",
+            "measured_at": "2026-09-12T08:00:00"}
+    if adjustment_reason is not None:
+        body["adjustment_reason"] = adjustment_reason
+    return body
+
+
+def submit_alignment(client, pid, **overrides):
+    payload = alignment_payload(**overrides)
+    r = client.post(f"/procedures/{pid}/alignment-checks", json=payload)
+    assert r.status_code == 201, r.text
+    return r.json()["alignment_check"]
+
 
 def good_curve_points(final_torque: float = 320.0, total_angle: float = 90.0,
                       n: int = 65) -> list[dict]:
@@ -55,6 +96,7 @@ def make_started(client: TestClient, **overrides) -> int:
     r = client.post("/procedures", json=payload)
     assert r.status_code == 201, r.text
     pid = r.json()["procedure"]["id"]
+    submit_alignment(client, pid)
     assert client.post(f"/procedures/{pid}/approve").status_code == 200
     assert client.post(f"/procedures/{pid}/start").status_code == 200
     return pid
@@ -362,10 +404,11 @@ def test_approve_rejects_infeasible_round(client):
     assert "第 1 轮" in detail["message"]
     # 只有第 1 轮冲突（第 2 轮 [95, 105] 与量程有交集）
     assert len(detail["conflicts"]) == 1
-    # 保持草稿；修正量程后可批准、可开工
+    # 保持草稿；补量程并提交对中预检后可批准、可开工
     assert client.get(f"/procedures/{pid}").json()["procedure"]["status"] == "draft"
     assert client.put(f"/procedures/{pid}",
                       json={**payload, "tool_range_min": 20.0}).status_code == 200
+    submit_alignment(client, pid)
     assert client.post(f"/procedures/{pid}/approve").status_code == 200
     assert client.post(f"/procedures/{pid}/start").status_code == 200
 
