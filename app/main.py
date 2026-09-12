@@ -9,11 +9,12 @@ from datetime import date, datetime
 from fastapi import Depends, FastAPI, HTTPException, Response
 from pydantic import ValidationError
 
+from .curve import analyze_curve, evaluate_curve_review
 from .db import get_conn, init_db, utcnow
 from .rules import find_infeasible_rounds, validate_report
-from .schemas import (BaselineRequest, DeriveRequest, ExcludeRequest,
-                      MeasurementBatchCreate, RemeasurementRequest, RetestRequest,
-                      ProcedureCreate, ReviewRequest, TorqueReport)
+from .schemas import (BaselineRequest, CurveAmend, CurveSubmit, DeriveRequest,
+                      ExcludeRequest, MeasurementBatchCreate, RemeasurementRequest,
+                      RetestRequest, ProcedureCreate, ReviewRequest, TorqueReport)
 from .sequencing import build_plan, sequence_violations
 from .svg import render_svg
 from .ultrasonic import GAP_MESSAGES, evaluate_batch, evaluate_reading
@@ -105,14 +106,20 @@ def _insert_proc(conn: sqlite3.Connection, data: ProcedureCreate, *,
         """INSERT INTO procedures
            (version, parent_id, change_note, status, flange_class, bolt_count, gasket,
             target_torque, stage_ratios, tolerance_pct, tool_id, tool_range_min,
-            tool_range_max, calibration_valid_until, start_angle_deg, clockwise, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            tool_range_max, calibration_valid_until, start_angle_deg, clockwise,
+            curve_direction, snug_torque, post_snug_angle_min_deg,
+            post_snug_angle_max_deg, max_sample_interval_ms, slope_drop_limit,
+            max_outlier_rate_pct, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             version, parent_id, change_note, "draft", data.flange_class, data.bolt_count,
             data.gasket, data.target_torque, json.dumps(data.stage_ratios),
             data.tolerance_pct, data.tool_id, data.tool_range_min, data.tool_range_max,
             data.calibration_valid_until.isoformat(), data.start_angle_deg,
-            int(data.clockwise), utcnow(),
+            int(data.clockwise), data.curve_direction, data.snug_torque,
+            data.post_snug_angle_min_deg, data.post_snug_angle_max_deg,
+            data.max_sample_interval_ms, data.slope_drop_limit,
+            data.max_outlier_rate_pct, utcnow(),
         ),
     )
     conn.commit()
@@ -129,6 +136,12 @@ def _proc_as_create(proc: dict, *, stage_ratios: list[float] | None = None) -> P
         tool_range_min=proc["tool_range_min"], tool_range_max=proc["tool_range_max"],
         calibration_valid_until=proc["calibration_valid_until"],
         start_angle_deg=proc["start_angle_deg"], clockwise=proc["clockwise"],
+        curve_direction=proc["curve_direction"], snug_torque=proc["snug_torque"],
+        post_snug_angle_min_deg=proc["post_snug_angle_min_deg"],
+        post_snug_angle_max_deg=proc["post_snug_angle_max_deg"],
+        max_sample_interval_ms=proc["max_sample_interval_ms"],
+        slope_drop_limit=proc["slope_drop_limit"],
+        max_outlier_rate_pct=proc["max_outlier_rate_pct"],
     )
 
 
@@ -224,11 +237,17 @@ def update_draft(pid: int, data: ProcedureCreate, conn: sqlite3.Connection = Dep
     conn.execute(
         """UPDATE procedures SET flange_class=?, bolt_count=?, gasket=?, target_torque=?,
            stage_ratios=?, tolerance_pct=?, tool_id=?, tool_range_min=?, tool_range_max=?,
-           calibration_valid_until=?, start_angle_deg=?, clockwise=? WHERE id=?""",
+           calibration_valid_until=?, start_angle_deg=?, clockwise=?,
+           curve_direction=?, snug_torque=?, post_snug_angle_min_deg=?,
+           post_snug_angle_max_deg=?, max_sample_interval_ms=?, slope_drop_limit=?,
+           max_outlier_rate_pct=? WHERE id=?""",
         (data.flange_class, data.bolt_count, data.gasket, data.target_torque,
          json.dumps(data.stage_ratios), data.tolerance_pct, data.tool_id,
          data.tool_range_min, data.tool_range_max, data.calibration_valid_until.isoformat(),
-         data.start_angle_deg, int(data.clockwise), pid),
+         data.start_angle_deg, int(data.clockwise), data.curve_direction,
+         data.snug_torque, data.post_snug_angle_min_deg, data.post_snug_angle_max_deg,
+         data.max_sample_interval_ms, data.slope_drop_limit, data.max_outlier_rate_pct,
+         pid),
     )
     conn.commit()
     return {"procedure": _fetch_proc(conn, pid)}
@@ -256,7 +275,29 @@ def start(pid: int, conn: sqlite3.Connection = Depends(get_db)):
 
 @app.post("/procedures/{pid}/review")
 def review(pid: int, body: ReviewRequest, conn: sqlite3.Connection = Depends(get_db)):
-    """复核：全部回传完成后进行。"""
+    """复核：全部回传完成，且终轮每栓都有可用轨迹、整圈离群率不超限才可通过。"""
+    proc = _fetch_proc(conn, pid)
+    if proc["status"] != "completed":
+        raise HTTPException(
+            409, f"工艺 {pid} 当前状态 {proc['status']}（{STATUS_LABEL.get(proc['status'])}），"
+                 "须为 completed 才能执行此操作"
+        )
+    gate = _curve_review(conn, proc)
+    if not gate["passed"]:
+        parts: list[str] = []
+        if gate["missing_bolts"]:
+            parts.append(f"缺轨迹栓 {gate['missing_bolts']}")
+        if gate["unusable_bolts"]:
+            parts.append(f"轨迹不可用栓 {gate['unusable_bolts']}")
+        if "outlier_rate_exceeded" in gate["blockers"]:
+            parts.append(f"整圈离群率 {gate['outlier_rate_pct']}% 超上限 "
+                         f"{gate['max_outlier_rate_pct']}%（离群栓 {gate['outlier_bolts']}）")
+        raise HTTPException(409, detail={
+            "reason": "curve_review_failed",
+            "message": "终轮轨迹复核未通过：" + "；".join(parts),
+            "blockers": gate["blockers"],
+            "curve_review": gate,
+        })
     proc = _transition(conn, pid, "completed", "reviewed", "reviewed_at",
                        extra=", reviewer=?, review_note=?",
                        params=(body.reviewer, body.note))
@@ -283,6 +324,12 @@ def derive(pid: int, body: DeriveRequest, conn: sqlite3.Connection = Depends(get
         "tool_range_max": proc["tool_range_max"],
         "calibration_valid_until": proc["calibration_valid_until"],
         "start_angle_deg": proc["start_angle_deg"], "clockwise": proc["clockwise"],
+        "curve_direction": proc["curve_direction"], "snug_torque": proc["snug_torque"],
+        "post_snug_angle_min_deg": proc["post_snug_angle_min_deg"],
+        "post_snug_angle_max_deg": proc["post_snug_angle_max_deg"],
+        "max_sample_interval_ms": proc["max_sample_interval_ms"],
+        "slope_drop_limit": proc["slope_drop_limit"],
+        "max_outlier_rate_pct": proc["max_outlier_rate_pct"],
     }
     overrides = body.model_dump(exclude_none=True, exclude={"change_note"})
     base.update(overrides)
@@ -371,6 +418,204 @@ def resume(pid: int, conn: sqlite3.Connection = Depends(get_db)):
     }
 
 
+# ---------------------------------------------------------------- 扭矩-转角轨迹
+
+# 允许提交/修订轨迹的工艺状态（复核通过后轨迹冻结）
+CURVE_STATUSES = ("in_progress", "completed")
+
+
+def _fetch_curve(conn: sqlite3.Connection, cid: int) -> dict:
+    row = conn.execute("SELECT * FROM torque_curves WHERE id=?", (cid,)).fetchone()
+    if row is None:
+        raise HTTPException(404, f"轨迹 {cid} 不存在")
+    return dict(row)
+
+
+def _curve_views(conn: sqlite3.Connection, pid: int) -> list[dict]:
+    """每栓当前采用修订的视图（曲线 id、修订号、关联记录、可用性与分析结果）。"""
+    rows = conn.execute(
+        """SELECT c.id AS curve_id, c.bolt_no, c.revision, c.created_at,
+                  r.record_id, r.usable, r.analysis
+           FROM torque_curves c
+           JOIN curve_revisions r ON r.curve_id=c.id AND r.revision=c.revision
+           WHERE c.procedure_id=? ORDER BY c.bolt_no""", (pid,)).fetchall()
+    return [{
+        "curve_id": r["curve_id"], "bolt_no": r["bolt_no"], "revision": r["revision"],
+        "record_id": r["record_id"], "usable": bool(r["usable"]),
+        "analysis": json.loads(r["analysis"]), "created_at": r["created_at"],
+    } for r in rows]
+
+
+def _curve_review(conn: sqlite3.Connection, proc: dict) -> dict:
+    return evaluate_curve_review(proc, _proc_plan(conn, proc),
+                                 _curve_views(conn, proc["id"]))
+
+
+def _check_final_round_record(conn: sqlite3.Connection, proc: dict,
+                              record_id: int) -> sqlite3.Row:
+    rec = conn.execute(
+        "SELECT * FROM records WHERE id=? AND procedure_id=?",
+        (record_id, proc["id"])).fetchone()
+    if rec is None:
+        raise HTTPException(409, detail={
+            "reason": "record_not_found",
+            "message": f"记录 {record_id} 不存在或不属于工艺 {proc['id']}",
+        })
+    final_round = len(proc["stage_ratios"])
+    if rec["round_no"] != final_round:
+        raise HTTPException(409, detail={
+            "reason": "not_final_round_record",
+            "message": f"记录 {record_id} 属于第 {rec['round_no']} 轮；"
+                       f"轨迹只能关联终轮（第 {final_round} 轮）的已接受记录",
+        })
+    return rec
+
+
+def _require_curve_window(proc: dict) -> None:
+    if proc["status"] not in CURVE_STATUSES:
+        raise HTTPException(409, detail={
+            "reason": "curve_window_closed",
+            "message": f"工艺状态 {proc['status']}：轨迹仅在 in_progress/completed 阶段"
+                       "可提交或修订；复核通过后轨迹冻结",
+        })
+
+
+def _store_revision(conn: sqlite3.Connection, curve_id: int, revision: int,
+                    record_id: int, *, time_unit: str, torque_unit: str,
+                    angle_unit: str, points: list[dict], snug_override: int | None,
+                    amendment_note: str | None, analysis: dict) -> None:
+    conn.execute(
+        """INSERT INTO curve_revisions
+           (curve_id, revision, record_id, time_unit, torque_unit, angle_unit,
+            points, snug_override, amendment_note, analysis, usable, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (curve_id, revision, record_id, time_unit, torque_unit, angle_unit,
+         json.dumps(points), snug_override, amendment_note, json.dumps(analysis),
+         int(not analysis["defects"]), utcnow()),
+    )
+
+
+@app.post("/procedures/{pid}/curves", status_code=201)
+def submit_curve(pid: int, body: CurveSubmit, conn: sqlite3.Connection = Depends(get_db)):
+    """终轮已接受记录关联一条扭矩-转角轨迹；每栓一条，换曲线须走修订。"""
+    proc = _fetch_proc(conn, pid)
+    _require_curve_window(proc)
+    rec = _check_final_round_record(conn, proc, body.record_id)
+    bolt_no = rec["bolt_no"]
+    exists = conn.execute(
+        "SELECT id FROM torque_curves WHERE procedure_id=? AND bolt_no=?",
+        (pid, bolt_no)).fetchone()
+    if exists:
+        raise HTTPException(409, detail={
+            "reason": "curve_exists_use_amend",
+            "message": f"螺栓 {bolt_no} 已有轨迹 {exists['id']}；移动贴合点或换用曲线"
+                       "须走修订接口并注明原因（旧轨迹保留可查）",
+            "curve_id": exists["id"],
+        })
+    points = [p.model_dump() for p in body.points]
+    analysis = analyze_curve(proc, points, time_unit=body.time_unit,
+                             torque_unit=body.torque_unit, angle_unit=body.angle_unit)
+    cur = conn.execute(
+        "INSERT INTO torque_curves (procedure_id, bolt_no, revision, record_id, created_at)"
+        " VALUES (?,?,1,?,?)", (pid, bolt_no, body.record_id, utcnow()))
+    _store_revision(conn, cur.lastrowid, 1, body.record_id,
+                    time_unit=body.time_unit, torque_unit=body.torque_unit,
+                    angle_unit=body.angle_unit, points=points, snug_override=None,
+                    amendment_note=None, analysis=analysis)
+    conn.commit()
+    return {
+        "curve_id": cur.lastrowid, "procedure_id": pid, "bolt_no": bolt_no,
+        "record_id": body.record_id, "revision": 1,
+        "usable": not analysis["defects"], "analysis": analysis,
+    }
+
+
+@app.get("/procedures/{pid}/curves")
+def list_curves(pid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """逐栓当前采用修订与整圈轨迹复核结论。"""
+    proc = _fetch_proc(conn, pid)
+    return {"procedure_id": pid, "curves": _curve_views(conn, pid),
+            "review": _curve_review(conn, proc)}
+
+
+@app.get("/procedures/{pid}/curve-review")
+def curve_review(pid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """整圈轨迹复核结论（review 门禁同款）：缺失/不可用/离群与离群率。"""
+    return _curve_review(conn, _fetch_proc(conn, pid))
+
+
+@app.get("/curves/{cid}")
+def get_curve(cid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """轨迹详情：全部修订（含旧轨迹原始点列），保持可查。"""
+    curve = _fetch_curve(conn, cid)
+    revisions = [dict(r) for r in conn.execute(
+        "SELECT * FROM curve_revisions WHERE curve_id=? ORDER BY revision",
+        (cid,)).fetchall()]
+    for r in revisions:
+        r["points"] = json.loads(r["points"])
+        r["analysis"] = json.loads(r["analysis"])
+        r["usable"] = bool(r["usable"])
+    return {"curve": curve, "revisions": revisions}
+
+
+@app.post("/curves/{cid}/amend", status_code=201)
+def amend_curve(cid: int, body: CurveAmend, conn: sqlite3.Connection = Depends(get_db)):
+    """修订轨迹：人工移动贴合点或换用曲线，记录原因并另存修订，旧轨迹保留。"""
+    curve = _fetch_curve(conn, cid)
+    proc = _fetch_proc(conn, curve["procedure_id"])
+    _require_curve_window(proc)
+    prev = dict(conn.execute(
+        "SELECT * FROM curve_revisions WHERE curve_id=? AND revision=?",
+        (cid, curve["revision"])).fetchone())
+
+    record_id = curve["record_id"]
+    if body.record_id is not None:
+        rec = _check_final_round_record(conn, proc, body.record_id)
+        if rec["bolt_no"] != curve["bolt_no"]:
+            raise HTTPException(409, detail={
+                "reason": "record_bolt_mismatch",
+                "message": f"记录 {body.record_id} 属于螺栓 {rec['bolt_no']}，"
+                           f"与轨迹所在螺栓 {curve['bolt_no']} 不一致",
+            })
+        record_id = body.record_id
+
+    if body.points is not None:
+        points = [p.model_dump() for p in body.points]
+        time_unit = body.time_unit or prev["time_unit"]
+        torque_unit = body.torque_unit or prev["torque_unit"]
+        angle_unit = body.angle_unit or prev["angle_unit"]
+        snug_override = body.snug_index  # 换曲线后旧人工贴合点不再适用
+    else:
+        points = json.loads(prev["points"])
+        time_unit = prev["time_unit"]
+        torque_unit = prev["torque_unit"]
+        angle_unit = prev["angle_unit"]
+        snug_override = (body.snug_index if body.snug_index is not None
+                         else prev["snug_override"])
+    if snug_override is not None and not (0 <= snug_override < len(points)):
+        raise HTTPException(422, detail={
+            "reason": "snug_index_out_of_range",
+            "message": f"人工贴合点索引 {snug_override} 超出轨迹点数 {len(points)}",
+        })
+
+    analysis = analyze_curve(proc, points, time_unit=time_unit,
+                             torque_unit=torque_unit, angle_unit=angle_unit,
+                             snug_override=snug_override)
+    new_rev = curve["revision"] + 1
+    conn.execute("UPDATE torque_curves SET revision=?, record_id=? WHERE id=?",
+                 (new_rev, record_id, cid))
+    _store_revision(conn, cid, new_rev, record_id, time_unit=time_unit,
+                    torque_unit=torque_unit, angle_unit=angle_unit, points=points,
+                    snug_override=snug_override,
+                    amendment_note=f"修订：{body.reason}", analysis=analysis)
+    conn.commit()
+    return {
+        "curve_id": cid, "procedure_id": proc["id"], "bolt_no": curve["bolt_no"],
+        "record_id": record_id, "revision": new_rev,
+        "usable": not analysis["defects"], "analysis": analysis,
+    }
+
+
 # ---------------------------------------------------------------- 作业包与图示
 
 def _revision_chain(conn: sqlite3.Connection, pid: int) -> dict:
@@ -410,13 +655,14 @@ def job_package(pid: int, conn: sqlite3.Connection = Depends(get_db)):
         "anomalies": anomalies,
         "revisions": _revision_chain(conn, pid),
         "measurement": _measurement_reference(conn, pid),
+        "curves": _curve_review(conn, proc),
         "generated_at": utcnow(),
     }
 
 
 @app.get("/procedures/{pid}/diagram.svg")
 def diagram(pid: int, conn: sqlite3.Connection = Depends(get_db)):
-    """圆周示意 SVG：方位、完成轮次、下一栓、异常与补拧标记。"""
+    """圆周示意 SVG：方位、完成轮次、下一栓、异常、补拧与轨迹复核标记。"""
     proc = _fetch_proc(conn, pid)
     plan = _proc_plan(conn, proc)
     records = _all_records(conn, pid)
@@ -425,7 +671,8 @@ def diagram(pid: int, conn: sqlite3.Connection = Depends(get_db)):
     done = [r for r in records if r["rework_of"] is None]
     next_step = plan[len(done)] if len(done) < len(plan) else None
     measurement = _measurement_reference(conn, pid)
-    svg = render_svg(proc, plan, records, anomalies, next_step, measurement)
+    curves = _curve_review(conn, proc)
+    svg = render_svg(proc, plan, records, anomalies, next_step, measurement, curves)
     return Response(content=svg, media_type="image/svg+xml")
 
 

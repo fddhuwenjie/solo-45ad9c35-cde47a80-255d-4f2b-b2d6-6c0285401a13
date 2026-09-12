@@ -1,8 +1,10 @@
-"""圆周示意 SVG：螺栓方位、完成轮次、下一栓、异常、补拧与超声伸长复核标记。"""
+"""圆周示意 SVG：螺栓方位、完成轮次、下一栓、异常、补拧、超声复核与轨迹复核标记。"""
 from __future__ import annotations
 
 import math
 from xml.sax.saxutils import escape
+
+from .curve import format_defect
 
 STATUS_LABEL = {
     "draft": "已创建(草稿)",
@@ -20,6 +22,12 @@ _STROKE_NEXT = "#0077b6"
 _STROKE_ANOMALY = "#d62828"
 _STROKE_US_OK = "#1b9e3e"       # 超声预紧力在目标带
 _STROKE_US_BAD = "#e85d04"      # 超声证据缺口/超差/被排除
+_CURVE_COLORS = {
+    "ok": "#0a9396",            # 轨迹可用且贴合后转角在批准范围
+    "outlier": "#9b5de5",       # 轨迹可用但离群（计入整圈离群率）
+    "unusable": "#d62828",      # 轨迹存在缺陷，不得进入复核结论
+    "missing": "#6c757d",       # 尚无轨迹
+}
 
 
 def _bolt_xy(index: int, n: int, cx: float, cy: float, r: float,
@@ -31,11 +39,11 @@ def _bolt_xy(index: int, n: int, cx: float, cy: float, r: float,
 
 def render_svg(proc: dict, plan: list[dict], records: list[dict],
                anomalies: list[dict], next_step: dict | None,
-               measurement: dict | None = None) -> str:
+               measurement: dict | None = None,
+               curve_review: dict | None = None) -> str:
     n = proc["bolt_count"]
     rounds = len(proc["stage_ratios"])
     cx, cy, r = 340.0, 400.0, 210.0
-    width, height = 680.0, 800.0
 
     rounds_done: dict[int, int] = {}
     rework_bolts: set[int] = set()
@@ -58,6 +66,23 @@ def render_svg(proc: dict, plan: list[dict], records: list[dict],
                 us_bad.add(b["bolt_no"])
             if b.get("locked"):
                 us_locked.add(b["bolt_no"])
+
+    curve_of: dict[int, dict] = {}
+    defect_lines: list[str] = []
+    if curve_review:
+        curve_of = {b["bolt_no"]: b for b in curve_review["bolts"]}
+        for b in curve_review["bolts"]:
+            if b["state"] != "unusable":
+                continue
+            for d in b["defects"][:2]:
+                defect_lines.append(f'栓{b["bolt_no"]}（采用 r{b["revision"]}）：'
+                                    f'{format_defect(d)}')
+        if len(defect_lines) > 6:
+            defect_lines = defect_lines[:6] + ["……其余缺陷区间见 JSON 作业包"]
+
+    # 底部缺陷区间清单行数决定画布高度
+    width = 680.0
+    height = 830.0 + 18.0 * len(defect_lines)
 
     header2 = (
         f'工具：{escape(proc["tool_id"])}（量程 {proc["tool_range_min"]}~'
@@ -95,6 +120,17 @@ def render_svg(proc: dict, plan: list[dict], records: list[dict],
             f'（限值 {v["imbalance_limit_pct"]}%）　'
             f'结论：{"已确认" if v["confirmed"] else "未确认（" + "、".join(v["blockers"]) + "）"}'
             f'</text>')
+    if curve_review:
+        total = len(curve_review["required_bolts"])
+        verdict = ("通过" if curve_review["passed"]
+                   else "未通过（" + "、".join(curve_review["blockers"]) + "）")
+        parts.append(
+            f'<text x="{cx:.0f}" y="154" text-anchor="middle" font-size="13" '
+            f'font-weight="bold" fill="#0a9396">'
+            f'扭矩-转角轨迹：可用 {curve_review["usable_count"]}/{total}　'
+            f'离群率 {curve_review["outlier_rate_pct"]}%'
+            f'（上限 {curve_review["max_outlier_rate_pct"]}%）　'
+            f'复核结论：{escape(verdict)}</text>')
     parts.append(
         f'<circle cx="{cx:.0f}" cy="{cy:.0f}" r="{r:.0f}" fill="none" '
         f'stroke="#adb5bd" stroke-width="1.5" stroke-dasharray="6 5"/>')
@@ -135,6 +171,19 @@ def render_svg(proc: dict, plan: list[dict], records: list[dict],
                 us_fill = _STROKE_US_BAD if bolt in us_bad else _STROKE_US_OK
             parts.append(f'<text x="{x:.1f}" y="{y - 40:.1f}" text-anchor="middle" '
                          f'font-size="10" font-weight="bold" fill="{us_fill}">{us_label}</text>')
+        cv_bolt = curve_of.get(bolt)
+        if cv_bolt is not None:
+            color = _CURVE_COLORS[cv_bolt["state"]]
+            parts.append(f'<circle cx="{x - 30:.1f}" cy="{y + 40:.1f}" r="4" fill="{color}"/>')
+            if cv_bolt["state"] == "missing":
+                cv_label = "无轨迹"
+            else:
+                angle = cv_bolt["post_snug_angle_deg"]
+                angle_txt = "—" if angle is None else f"{angle:.1f}°"
+                cv_label = (f'r{cv_bolt["revision"]}·{angle_txt}'
+                            f'·#{cv_bolt["record_id"]}')
+            parts.append(f'<text x="{x + 4:.1f}" y="{y + 44:.1f}" text-anchor="middle" '
+                         f'font-size="9" fill="{color}">{escape(cv_label)}</text>')
 
     legend = [
         (_FILL_PENDING, "待紧固"), (_FILL_PARTIAL, "部分轮次"), (_FILL_DONE, "全部轮次"),
@@ -160,13 +209,29 @@ def render_svg(proc: dict, plan: list[dict], records: list[dict],
         parts.append(f'<circle cx="{x0:.0f}" cy="724" r="13" fill="none" '
                      f'stroke="{_STROKE_US_BAD}" stroke-width="2.5"/>')
         parts.append(f'<text x="{x0 + 19:.0f}" y="729" font-size="13">超声缺口/超差</text>')
-    parts.append(f'<text x="{cx:.0f}" y="756" text-anchor="middle" font-size="11" '
+    if curve_review:
+        x0 = 70.0
+        for state, label in (("ok", "轨迹合格"), ("outlier", "轨迹离群"),
+                             ("unusable", "轨迹不可用"), ("missing", "无轨迹")):
+            parts.append(f'<circle cx="{x0:.0f}" cy="748" r="5" '
+                         f'fill="{_CURVE_COLORS[state]}"/>')
+            parts.append(f'<text x="{x0 + 10:.0f}" y="753" font-size="13">{label}</text>')
+            x0 += 118.0
+        parts.append(f'<text x="{x0 + 6:.0f}" y="753" font-size="11" fill="#868e96">'
+                     f'栓下标注：采用修订 r·贴合后转角·关联记录#id</text>')
+    parts.append(f'<text x="{cx:.0f}" y="776" text-anchor="middle" font-size="11" '
                  f'fill="#868e96">圆点内数字为轮内紧固次序；外侧粗体为螺栓编号；'
                  f'螺栓旁为超声换算预紧力（缺口仅留痕，不判合格）</text>')
-    parts.append(f'<text x="{cx:.0f}" y="774" text-anchor="middle" font-size="11" '
+    parts.append(f'<text x="{cx:.0f}" y="794" text-anchor="middle" font-size="11" '
                  f'fill="#868e96">本图与 JSON 作业包引用同一测量版本'
                  + (f'：批次 #{measurement["batch_id"]} r{measurement["revision"]}'
                     if measurement else "（尚无测量批次）")
-                 + '</text>')
+                 + '；轨迹标注为当前采用修订</text>')
+    if defect_lines:
+        parts.append(f'<text x="70" y="820" font-size="12" font-weight="bold" '
+                     f'fill="{_CURVE_COLORS["unusable"]}">轨迹缺陷区间（不得进入复核结论）：</text>')
+        for i, line in enumerate(defect_lines):
+            parts.append(f'<text x="86" y="{838 + 18 * i}" font-size="11" '
+                         f'fill="#495057">{escape(line)}</text>')
     parts.append("</svg>")
     return "\n".join(parts)

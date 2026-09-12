@@ -24,6 +24,14 @@ CREATE TABLE IF NOT EXISTS procedures (
     calibration_valid_until TEXT NOT NULL, -- ISO 日期
     start_angle_deg REAL NOT NULL DEFAULT 0,
     clockwise INTEGER NOT NULL DEFAULT 1,
+    -- 扭矩-转角轨迹复核参数（批准时锁定）
+    curve_direction TEXT NOT NULL DEFAULT 'cw',
+    snug_torque REAL NOT NULL,
+    post_snug_angle_min_deg REAL NOT NULL,
+    post_snug_angle_max_deg REAL NOT NULL,
+    max_sample_interval_ms REAL NOT NULL,
+    slope_drop_limit REAL NOT NULL,
+    max_outlier_rate_pct REAL NOT NULL,
     created_at TEXT NOT NULL,
     approved_at TEXT,
     started_at TEXT,
@@ -133,7 +141,48 @@ CREATE TABLE IF NOT EXISTS rework_jobs (
     target_bolts TEXT NOT NULL,             -- JSON：补拧螺栓
     created_at TEXT NOT NULL
 );
+
+-- 扭矩-转角轨迹：每栓一条，关联终轮已接受记录；revision 指向当前采用修订
+CREATE TABLE IF NOT EXISTS torque_curves (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    procedure_id INTEGER NOT NULL REFERENCES procedures(id),
+    bolt_no INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,    -- 当前采用修订号
+    record_id INTEGER NOT NULL REFERENCES records(id),  -- 当前关联的终轮记录
+    created_at TEXT NOT NULL,
+    UNIQUE (procedure_id, bolt_no)
+);
+
+-- 轨迹修订：原始轨迹逐版保存（提交单位），人工移动贴合点/换曲线均另存新版，
+-- 旧版本永不覆盖、保持可查；analysis 为分析结果 JSON（指标 + 缺陷区间）
+CREATE TABLE IF NOT EXISTS curve_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    curve_id INTEGER NOT NULL REFERENCES torque_curves(id),
+    revision INTEGER NOT NULL,
+    record_id INTEGER NOT NULL REFERENCES records(id),
+    time_unit TEXT NOT NULL,
+    torque_unit TEXT NOT NULL,
+    angle_unit TEXT NOT NULL,
+    points TEXT NOT NULL,                   -- 原始轨迹 JSON（提交单位）
+    snug_override INTEGER,                  -- 人工贴合点索引；NULL 为自动定位
+    amendment_note TEXT,                    -- 修订原因（首修订为 NULL）
+    analysis TEXT NOT NULL,                 -- 分析结果 JSON
+    usable INTEGER NOT NULL,                -- 该修订是否可进入复核结论
+    created_at TEXT NOT NULL,
+    UNIQUE (curve_id, revision)
+);
 """
+
+# 既有库迁移：为 procedures 补充轨迹复核参数列（默认宽松值，新工艺由 API 写入真实值）
+_PROCEDURE_CURVE_COLUMNS = (
+    ("curve_direction", "TEXT NOT NULL DEFAULT 'cw'"),
+    ("snug_torque", "REAL NOT NULL DEFAULT 0"),
+    ("post_snug_angle_min_deg", "REAL NOT NULL DEFAULT 0"),
+    ("post_snug_angle_max_deg", "REAL NOT NULL DEFAULT 100000"),
+    ("max_sample_interval_ms", "REAL NOT NULL DEFAULT 1e15"),
+    ("slope_drop_limit", "REAL NOT NULL DEFAULT 1e15"),
+    ("max_outlier_rate_pct", "REAL NOT NULL DEFAULT 100"),
+)
 
 
 def db_path() -> str:
@@ -150,6 +199,10 @@ def get_conn() -> sqlite3.Connection:
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(procedures)")}
+        for name, ddl in _PROCEDURE_CURVE_COLUMNS:
+            if name not in cols:
+                conn.execute(f"ALTER TABLE procedures ADD COLUMN {name} {ddl}")
 
 
 def utcnow() -> str:

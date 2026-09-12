@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+CurveDirection = Literal["cw", "ccw"]
 
 
 class ProcedureCreate(BaseModel):
@@ -21,6 +24,14 @@ class ProcedureCreate(BaseModel):
     calibration_valid_until: date = Field(..., description="校准有效期（含当日）")
     start_angle_deg: float = Field(0.0, description="1 号螺栓方位角，0 为正上方，顺时针为正")
     clockwise: bool = Field(True, description="编号是否顺时针递增")
+    # ---- 扭矩-转角轨迹复核参数（批准时锁定）----
+    curve_direction: CurveDirection = Field("cw", description="紧固旋向：cw 顺时针 / ccw 逆时针（轨迹角度展开方向）")
+    snug_torque: float = Field(..., gt=0, description="贴合扭矩 N·m（轨迹贴合点定位阈值）")
+    post_snug_angle_min_deg: float = Field(..., ge=0, description="贴合后转角下限 deg")
+    post_snug_angle_max_deg: float = Field(..., gt=0, description="贴合后转角上限 deg")
+    max_sample_interval_ms: float = Field(..., gt=0, description="最大采样间隔 ms")
+    slope_drop_limit: float = Field(..., gt=0, description="分段斜率突降限值 (N·m)/deg")
+    max_outlier_rate_pct: float = Field(..., ge=0, le=100, description="整圈离群率上限 %")
 
     @field_validator("bolt_count")
     @classmethod
@@ -53,6 +64,16 @@ class ProcedureCreate(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_curve_params(self) -> "ProcedureCreate":
+        if self.snug_torque >= self.target_torque:
+            raise ValueError(
+                f"贴合扭矩 {self.snug_torque} N·m 须小于目标扭矩 {self.target_torque} N·m"
+            )
+        if self.post_snug_angle_max_deg <= self.post_snug_angle_min_deg:
+            raise ValueError("贴合后转角上限须大于下限")
+        return self
+
 
 class TorqueReport(BaseModel):
     """逐栓回传：工具、操作者、时刻与实测扭矩。"""
@@ -83,6 +104,13 @@ class DeriveRequest(BaseModel):
     tool_range_min: float | None = None
     tool_range_max: float | None = None
     calibration_valid_until: date | None = None
+    curve_direction: CurveDirection | None = None
+    snug_torque: float | None = None
+    post_snug_angle_min_deg: float | None = None
+    post_snug_angle_max_deg: float | None = None
+    max_sample_interval_ms: float | None = None
+    slope_drop_limit: float | None = None
+    max_outlier_rate_pct: float | None = None
 
 
 # ---------------------------------------------------------------- 超声伸长复核
@@ -153,3 +181,40 @@ class ExcludeRequest(BaseModel):
 
     bolt_no: int = Field(..., ge=1, description="螺栓编号 1..N")
     reason: str = Field(..., min_length=1, description="排除理由")
+
+
+# ---------------------------------------------------------------- 扭矩-转角轨迹
+
+TimeUnit = Literal["s", "ms"]
+TorqueUnit = Literal["Nm", "Nmm", "lbfft"]
+AngleUnit = Literal["deg", "rev", "rad"]
+
+
+class CurvePoint(BaseModel):
+    """单个采样点：时刻、扭矩、转角（单位由提交级字段声明）。"""
+
+    t: float = Field(..., description="采样时刻（time_unit 单位）")
+    torque: float = Field(..., description="扭矩读数（torque_unit 单位）")
+    angle: float = Field(..., description="角度读数（angle_unit 单位，设备零点任意）")
+
+
+class CurveSubmit(BaseModel):
+    """终轮已接受记录关联一条扭矩-转角轨迹（每栓一条，换曲线走修订）。"""
+
+    record_id: int = Field(..., ge=1, description="关联的终轮已接受记录 id")
+    points: list[CurvePoint] = Field(..., min_length=2, description="采样序列")
+    time_unit: TimeUnit = Field("s", description="时刻单位")
+    torque_unit: TorqueUnit = Field("Nm", description="扭矩单位")
+    angle_unit: AngleUnit = Field("deg", description="角度单位")
+
+
+class CurveAmend(BaseModel):
+    """轨迹修订：人工移动贴合点或换用曲线，须注明原因；旧轨迹保留可查。"""
+
+    reason: str = Field(..., min_length=1, description="修订原因（写入修订链）")
+    points: list[CurvePoint] | None = Field(None, description="换用的新轨迹；缺省沿用原轨迹")
+    time_unit: TimeUnit | None = Field(None, description="新轨迹时刻单位；缺省沿用原单位")
+    torque_unit: TorqueUnit | None = Field(None, description="新轨迹扭矩单位；缺省沿用原单位")
+    angle_unit: AngleUnit | None = Field(None, description="新轨迹角度单位；缺省沿用原单位")
+    snug_index: int | None = Field(None, ge=0, description="人工贴合点（采样点索引）；缺省自动定位")
+    record_id: int | None = Field(None, ge=1, description="重新关联的终轮记录 id；缺省不变")

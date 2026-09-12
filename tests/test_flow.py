@@ -23,9 +23,23 @@ BASE = {
     "calibration_valid_until": "2026-12-31",
     "start_angle_deg": 0.0,
     "clockwise": True,
+    "curve_direction": "cw",
+    "snug_torque": 40.0,
+    "post_snug_angle_min_deg": 30.0,
+    "post_snug_angle_max_deg": 120.0,
+    "max_sample_interval_ms": 50.0,
+    "slope_drop_limit": 5.0,
+    "max_outlier_rate_pct": 25.0,
 }
 
 SEQ8 = [1, 5, 2, 6, 3, 7, 4, 8]  # 8 栓交叉顺序
+
+
+def good_curve_points(final_torque: float = 320.0, total_angle: float = 90.0,
+                      n: int = 65) -> list[dict]:
+    """线性升至目标扭矩的合格轨迹（贴合后转角 78.75°，在批准范围内）。"""
+    return [{"t": i * 0.02, "torque": final_torque * i / (n - 1),
+             "angle": total_angle * i / (n - 1)} for i in range(n)]
 
 
 @pytest.fixture()
@@ -70,6 +84,17 @@ def run_all_steps(client, pid):
     return r
 
 
+def submit_curves_all(client, pid):
+    """为终轮每栓的已接受记录提交合格轨迹（review 门禁前置）。"""
+    pkg = client.get(f"/procedures/{pid}/package").json()
+    final_round = max(r["round_no"] for r in pkg["records"])
+    for rec in pkg["records"]:
+        if rec["round_no"] == final_round and rec["rework_of"] is None:
+            r = client.post(f"/procedures/{pid}/curves", json={
+                "record_id": rec["id"], "points": good_curve_points()})
+            assert r.status_code == 201, r.text
+
+
 # ------------------------------------------------------------ 顺序生成
 
 def test_cross_sequence_properties():
@@ -95,6 +120,7 @@ def test_full_lifecycle(client):
     pid = make_started(client)
     r = run_all_steps(client, pid)
     assert r.json()["status"] == "completed"
+    submit_curves_all(client, pid)  # 终轮每栓轨迹齐备，review 方可通过
 
     r = client.post(f"/procedures/{pid}/review", json={"reviewer": "李四", "note": "合格"})
     assert r.status_code == 200
@@ -184,6 +210,7 @@ def test_tool_mismatch_rejected(client):
 def test_report_after_archive_rejected(client):
     pid = make_started(client)
     run_all_steps(client, pid)
+    submit_curves_all(client, pid)
     client.post(f"/procedures/{pid}/review", json={"reviewer": "李四"})
     client.post(f"/procedures/{pid}/archive")
     r = report(client, pid, 1, 96.0)

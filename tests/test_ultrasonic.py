@@ -22,6 +22,13 @@ BASE = {
     "calibration_valid_until": "2026-12-31",
     "start_angle_deg": 0.0,
     "clockwise": True,
+    "curve_direction": "cw",
+    "snug_torque": 40.0,
+    "post_snug_angle_min_deg": 30.0,
+    "post_snug_angle_max_deg": 120.0,
+    "max_sample_interval_ms": 50.0,
+    "slope_drop_limit": 5.0,
+    "max_outlier_rate_pct": 25.0,
 }
 SEQ8 = [1, 5, 2, 6, 3, 7, 4, 8]
 
