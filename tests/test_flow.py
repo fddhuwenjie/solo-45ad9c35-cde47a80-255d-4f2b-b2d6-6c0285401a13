@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.db import init_db
 from app.main import app
-from app.rules import find_infeasible_rounds, validate_report
+from app.rules import allowed_interval, find_infeasible_rounds, validate_report
 from app.schemas import TorqueReport
 from app.sequencing import build_plan, circular_distance, cross_sequence, sequence_violations
 
@@ -349,6 +349,72 @@ def test_find_infeasible_rounds_unit():
     # 两轮都越界
     conflicts = find_infeasible_rounds(100.0, [0.3, 1.0], 5.0, 110.0, 150.0)
     assert [c["round_no"] for c in conflicts] == [1, 2]
+
+
+def test_approve_rejects_decimal_boundary(client):
+    """小数边界：首轮真实上界 34.9965 < 量程下限 35.0，舍入不得误判为可行。"""
+    payload = {**BASE, "target_torque": 111.1, "stage_ratios": [0.3, 1.0],
+               "tool_range_min": 35.0, "tool_range_max": 150.0}
+    r = client.post("/procedures", json=payload)
+    assert r.status_code == 201
+    pid = r.json()["procedure"]["id"]
+
+    r = client.post(f"/procedures/{pid}/approve")
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["reason"] == "round_interval_infeasible"
+    assert len(detail["conflicts"]) == 1  # 第 2 轮 [105.545, 116.655] 与量程有交集
+    conflict = detail["conflicts"][0]
+    assert conflict["round_no"] == 1
+    assert conflict["target_torque"] == 33.33
+    assert conflict["allowed_interval"] == [31.6635, 34.9965]  # 展示舍入到 4 位
+    assert conflict["tool_range"] == [35.0, 150.0]
+    assert "第 1 轮" in detail["message"]
+    assert client.get(f"/procedures/{pid}").json()["procedure"]["status"] == "draft"
+
+
+def test_decimal_boundary_tolerance_check():
+    """同一边界在回传侧：35.0 超差被拒，34.9965 合格——与前置判断共用精确边界。
+
+    （量程放宽到 30.0 以隔离偏差判断；原配置中 34.9965 同时越量程，
+    正是该配置不可行的原因。）
+    """
+    proc = {
+        "status": "in_progress", "bolt_count": 8, "tool_id": "T",
+        "calibration_valid_until": __import__("datetime").date(2026, 12, 31),
+        "tool_range_min": 30.0, "tool_range_max": 150.0,
+        "target_torque": 111.1, "stage_ratios": [0.3, 1.0], "tolerance_pct": 5.0,
+    }
+    plan = build_plan(8, 111.1, [0.3, 1.0])
+    assert plan[0]["target_torque"] == 33.33
+
+    def rep(torque):
+        return TorqueReport(bolt_no=1, tool_id="T", operator="x",
+                            reported_at="2026-09-12T09:00:00", measured_torque=torque)
+
+    rej = validate_report(proc, plan, [], rep(35.0))
+    assert rej is not None and rej.reason == "torque_out_of_tolerance"
+    assert validate_report(proc, plan, [], rep(34.9965)) is None
+
+
+def test_preflight_and_tolerance_consistent():
+    """一致性：前置判定某轮不可行 ⟺ 不存在同时通过量程与偏差校验的实测值。"""
+    cases = [
+        (111.1, [0.3, 1.0], 5.0, 35.0, 150.0),        # 首轮小数边界不可行
+        (100.0, [0.3, 1.0], 5.0, 50.0, 150.0),        # 首轮不可行
+        (100.0, [0.5, 1.0], 5.0, 52.5, 150.0),        # 端点相切，可行
+        (320.0, [0.3, 0.6, 1.0], 5.0, 50.0, 500.0),   # 全可行
+        (80.0, [0.4, 1.0], 3.0, 10.0, 30.0),          # 两轮都不可行
+    ]
+    for target, ratios, tol, tmin, tmax in cases:
+        conflicts = find_infeasible_rounds(target, ratios, tol, tmin, tmax)
+        conflict_rounds = {c["round_no"] for c in conflicts}
+        for i, ratio in enumerate(ratios, start=1):
+            round_target = round(target * ratio, 2)
+            lo, hi = allowed_interval(round_target, tol)
+            feasible_exists = max(lo, tmin) <= min(hi, tmax)
+            assert (i in conflict_rounds) == (not feasible_exists), (
+                target, ratios, tol, tmin, tmax, i)
 
 
 # ------------------------------------------------------------ 相邻守卫（规则层单测）

@@ -29,6 +29,15 @@ class Rejection:
         }
 
 
+def allowed_interval(target: float, tolerance_pct: float) -> tuple[float, float]:
+    """允许区间 [target*(1-偏差), target*(1+偏差)]，精确值。
+
+    前置可行性校验与回传偏差判断共用同一边界计算；任何舍入只允许
+    出现在展示层，不得参与可行性/合格性判断。
+    """
+    return (target * (1 - tolerance_pct / 100), target * (1 + tolerance_pct / 100))
+
+
 def find_infeasible_rounds(
     target_torque: float,
     stage_ratios: list[float],
@@ -36,22 +45,22 @@ def find_infeasible_rounds(
     tool_range_min: float,
     tool_range_max: float,
 ) -> list[dict]:
-    """逐轮检查允许区间 [目标*(1-偏差), 目标*(1+偏差)] 与工具量程是否有交集。
+    """逐轮检查允许区间与工具量程是否有交集（精确边界判断）。
 
-    无交集的轮次任何回传都不可能合格，须在批准前拒绝。返回冲突轮次列表。
+    无交集的轮次任何回传都不可能合格，须在批准前拒绝。返回冲突轮次列表；
+    区间在 payload 中舍入到 4 位小数仅用于展示，不影响判断。
     """
     conflicts: list[dict] = []
     for round_no, ratio in enumerate(stage_ratios, start=1):
-        target = round(target_torque * ratio, 2)
-        lo = round(target * (1 - tolerance_pct / 100), 2)
-        hi = round(target * (1 + tolerance_pct / 100), 2)
+        target = round(target_torque * ratio, 2)  # 与 build_plan 的轮目标一致
+        lo, hi = allowed_interval(target, tolerance_pct)
         if hi < tool_range_min or lo > tool_range_max:
             conflicts.append(
                 {
                     "round_no": round_no,
                     "ratio": ratio,
                     "target_torque": target,
-                    "allowed_interval": [lo, hi],
+                    "allowed_interval": [round(lo, 4), round(hi, 4)],
                     "tool_range": [tool_range_min, tool_range_max],
                 }
             )
@@ -59,8 +68,9 @@ def find_infeasible_rounds(
 
 
 def _check_tolerance(proc: dict, report: TorqueReport, target: float) -> Rejection | None:
-    dev_pct = abs(report.measured_torque - target) / target * 100
-    if dev_pct > proc["tolerance_pct"]:
+    lo, hi = allowed_interval(target, proc["tolerance_pct"])
+    if not (lo <= report.measured_torque <= hi):
+        dev_pct = abs(report.measured_torque - target) / target * 100
         return Rejection(
             "torque_out_of_tolerance",
             f"螺栓 {report.bolt_no} 实测 {report.measured_torque} N·m，"
