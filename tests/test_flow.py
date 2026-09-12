@@ -37,8 +37,8 @@ SEQ8 = [1, 5, 2, 6, 3, 7, 4, 8]  # 8 栓交叉顺序
 
 def good_curve_points(final_torque: float = 320.0, total_angle: float = 90.0,
                       n: int = 65) -> list[dict]:
-    """线性升至目标扭矩的合格轨迹（贴合后转角 78.75°，在批准范围内）。"""
-    return [{"t": i * 0.02, "torque": final_torque * i / (n - 1),
+    """线性升至目标扭矩的合格轨迹（全部样点在批准量程 50~500 N·m 内）。"""
+    return [{"t": i * 0.02, "torque": 60.0 + (final_torque - 60.0) * i / (n - 1),
              "angle": total_angle * i / (n - 1)} for i in range(n)]
 
 

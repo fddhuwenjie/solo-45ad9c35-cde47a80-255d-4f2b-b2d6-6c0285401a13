@@ -111,12 +111,13 @@ def segment_slopes(rotation: list[float], torques: list[float],
     return segs
 
 
-def _out_of_range_runs(torques: list[float], tool_max: float) -> list[tuple[int, int]]:
-    """越出工具量程（负值或超过量程上限）的连续索引区间。"""
+def _out_of_range_runs(torques: list[float], tool_min: float,
+                       tool_max: float) -> list[tuple[int, int]]:
+    """越出工具量程（低于下限或超过上限）的连续索引区间。"""
     runs: list[tuple[int, int]] = []
     start = None
     for i, t in enumerate(torques):
-        bad = t < 0 or t > tool_max
+        bad = t < tool_min or t > tool_max
         if bad and start is None:
             start = i
         elif not bad and start is not None:
@@ -163,13 +164,15 @@ def analyze_curve(proc: dict, points: list[dict], *, time_unit: str,
                 "t_s": [round(ts[i - 1], 6), round(ts[i], 6)],
                 "interval_s": round(dt, 6), "max_interval_s": max_dt}))
 
-    # 读数越出工具量程（负值或超过量程上限），按连续区间返回
+    # 读数越出工具量程（低于下限或超过上限），按连续区间返回
+    tool_min = proc["tool_range_min"]
     tool_max = proc["tool_range_max"]
-    for a, b in _out_of_range_runs(tq, tool_max):
+    for a, b in _out_of_range_runs(tq, tool_min, tool_max):
         defects.append(_defect(D_OUT_OF_RANGE, {
             "start_index": a, "end_index": b,
             "min_torque_nm": round(min(tq[a:b + 1]), 4),
             "max_torque_nm": round(max(tq[a:b + 1]), 4),
+            "tool_range_min_nm": tool_min,
             "tool_range_max_nm": tool_max}))
 
     # 角度反转（反旋向回退超过容差）
@@ -323,7 +326,8 @@ def format_defect(defect: dict) -> str:
                 f"＞上限 {iv['max_interval_s']}s")
     if reason == D_OUT_OF_RANGE:
         return (f"{msg}：点{iv['start_index']}–{iv['end_index']} "
-                f"读数 {iv['min_torque_nm']}~{iv['max_torque_nm']} N·m")
+                f"读数 {iv['min_torque_nm']}~{iv['max_torque_nm']} N·m，"
+                f"量程 {iv['tool_range_min_nm']}~{iv['tool_range_max_nm']} N·m")
     if reason == D_ANGLE_REVERSAL:
         return (f"{msg}：点{iv['point_index']} 转角 "
                 f"{iv['rotation_deg'][0]}→{iv['rotation_deg'][1]}°")

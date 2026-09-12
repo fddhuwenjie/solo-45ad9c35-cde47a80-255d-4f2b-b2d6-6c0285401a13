@@ -40,14 +40,16 @@ SEQ8 = [1, 5, 2, 6, 3, 7, 4, 8]
 PROC = {k: BASE[k] for k in (
     "curve_direction", "snug_torque", "post_snug_angle_min_deg",
     "post_snug_angle_max_deg", "max_sample_interval_ms", "slope_drop_limit",
-    "max_outlier_rate_pct")}
-PROC["tool_range_max"] = BASE["tool_range_max"]
+    "max_outlier_rate_pct", "tool_range_min", "tool_range_max")}
 
 
 def good_curve(final_torque: float = 320.0, total_angle: float = 90.0,
                n: int = 65) -> list[dict]:
-    """线性升至目标扭矩的合格轨迹：贴合后转角 78.75° ∈ [30, 120]。"""
-    return [{"t": i * 0.02, "torque": final_torque * i / (n - 1),
+    """线性合格轨迹：60→320 N·m（全部样点在批准量程 50~500 内）。
+
+    首点 60 N·m ≥ 贴合扭矩 40，贴合点位于首点，贴合后转角即全转角 90°。
+    """
+    return [{"t": i * 0.02, "torque": 60.0 + (final_torque - 60.0) * i / (n - 1),
              "angle": total_angle * i / (n - 1)} for i in range(n)]
 
 
@@ -113,12 +115,13 @@ def test_unwrap_cross_zero_ccw():
 
 def test_analyze_normalizes_units():
     """ms / lbfft / rev 提交单位与 s / N·m / deg 分析结果一致。"""
+    proc = {**PROC, "tool_range_min": 0.0}  # 隔离量程门控，专验单位换算
     n = 65
     points = [{"t": i * 20.0,                                    # ms
                "torque": 320.0 * i / (n - 1) / 1.3558179483314004,  # lbfft
                "angle": 0.25 * i / (n - 1)}                       # rev（共 90°）
               for i in range(n)]
-    a = analyze_curve(PROC, points, time_unit="ms", torque_unit="lbfft",
+    a = analyze_curve(proc, points, time_unit="ms", torque_unit="lbfft",
                       angle_unit="rev")
     assert a["defects"] == []
     assert a["peak_torque_nm"] == pytest.approx(320.0, abs=1e-6)
@@ -143,8 +146,11 @@ def test_analyze_angle_zero_offset_irrelevant():
 # ------------------------------------------------------------ 指标手算核对
 
 def test_analyze_handcalc_metrics():
-    a = analyze_curve(PROC, good_curve(), time_unit="s", torque_unit="Nm",
-                      angle_unit="deg")
+    # 量程下界置 0 以隔离门控，保留 0→320 线性曲线的完整手算核对
+    proc = {**PROC, "tool_range_min": 0.0}
+    pts = [{"t": i * 0.02, "torque": 320.0 * i / 64, "angle": 90.0 * i / 64}
+           for i in range(65)]
+    a = analyze_curve(proc, pts, time_unit="s", torque_unit="Nm", angle_unit="deg")
     assert a["defects"] == []
     assert a["snug_index"] == 8 and a["snug_source"] == "auto"  # 扭矩 40 首达点
     assert a["post_snug_angle_deg"] == pytest.approx(78.75, abs=1e-9)
@@ -206,7 +212,32 @@ def test_defect_reading_out_of_range():
               if d["reason"] == D_OUT_OF_RANGE)
     assert (iv["start_index"], iv["end_index"]) == (50, 51)
     assert iv["max_torque_nm"] == 610.0
+    assert iv["tool_range_min_nm"] == 50.0
     assert iv["tool_range_max_nm"] == 500.0
+
+
+def test_defect_reading_below_tool_range_min():
+    """量程下界门控：低于 tool_range_min 的连续样点区间判缺陷，轨迹不可用。"""
+    pts = good_curve()
+    for i in range(20, 23):
+        pts[i]["torque"] = 45.0  # 低于量程下限 50
+    a = analyze_curve(PROC, pts, time_unit="s", torque_unit="Nm", angle_unit="deg")
+    assert D_OUT_OF_RANGE in _reasons(a)
+    iv = next(d["interval"] for d in a["defects"]
+              if d["reason"] == D_OUT_OF_RANGE)
+    assert (iv["start_index"], iv["end_index"]) == (20, 22)
+    assert iv["min_torque_nm"] == 45.0
+    assert iv["tool_range_min_nm"] == 50.0
+    assert iv["tool_range_max_nm"] == 500.0
+
+
+def test_curve_at_tool_range_bounds_usable():
+    """量程边界含端点：读数恰为下限 50 / 上限 500 不判越界。"""
+    pts = [{"t": i * 0.02, "torque": 50.0 + 450.0 * i / 64,
+            "angle": 90.0 * i / 64} for i in range(65)]
+    a = analyze_curve(PROC, pts, time_unit="s", torque_unit="Nm", angle_unit="deg")
+    assert a["defects"] == []
+    assert a["post_snug_in_range"] is True
 
 
 def test_defect_angle_reversal():
@@ -221,11 +252,11 @@ def test_defect_angle_reversal():
 
 
 def test_defect_early_peak():
-    # 螺纹咬伤：扭矩提前冲到 320 后回落至 250
+    # 螺纹咬伤：扭矩提前冲到 320 后回落至 250（全程在量程内）
     pts = []
     for i in range(65):
         if i <= 51:
-            tq = 320.0 * i / 51
+            tq = 60.0 + 260.0 * i / 51
         else:
             tq = 320.0 - (i - 51) * (70.0 / 13)
         pts.append({"t": i * 0.02, "torque": tq, "angle": 90.0 * i / 64})
@@ -239,11 +270,11 @@ def test_defect_early_peak():
 
 
 def test_defect_slope_collapse():
-    # 垫片突然就位/螺纹咬伤：前段斜率 8，后段跌至 0.9（突降 7.1 > 限值 5）
+    # 垫片突然就位/螺纹咬伤：前段斜率 8，后段跌至 0.9（突降 6.27 > 限值 5）
     pts = []
     for i in range(65):
         ang = 90.0 * i / 64
-        tq = 8.0 * ang if ang <= 25.0 else 200.0 + 0.9 * (ang - 25.0)
+        tq = 60.0 + 8.0 * ang if ang <= 25.0 else 260.0 + 0.9 * (ang - 25.0)
         pts.append({"t": i * 0.02, "torque": tq, "angle": ang})
     a = analyze_curve(PROC, pts, time_unit="s", torque_unit="Nm", angle_unit="deg")
     assert _reasons(a) == [D_SLOPE_COLLAPSE]
@@ -254,8 +285,11 @@ def test_defect_slope_collapse():
 
 
 def test_defect_snug_not_reached():
-    a = analyze_curve(PROC, good_curve(final_torque=30.0), time_unit="s",
-                      torque_unit="Nm", angle_unit="deg")
+    # 全程 30 N·m 未达到贴合扭矩 40（同时低于量程下限，两个缺陷都应记录）
+    pts = [{"t": i * 0.02, "torque": 30.0, "angle": 90.0 * i / 64}
+           for i in range(65)]
+    a = analyze_curve(PROC, pts, time_unit="s", torque_unit="Nm",
+                      angle_unit="deg")
     assert D_SNUG_NOT_REACHED in _reasons(a)
     assert a["snug_index"] is None
     assert a["post_snug_angle_deg"] is None
@@ -337,7 +371,7 @@ def test_review_passes_with_all_curves(client):
     for b in pkg["curves"]["bolts"]:
         assert b["state"] == "ok" and b["revision"] == 1
         assert b["record_id"] == ids[b["bolt_no"]]
-        assert b["post_snug_angle_deg"] == pytest.approx(78.75)
+        assert b["post_snug_angle_deg"] == pytest.approx(90.0)
 
 
 def test_review_blocked_by_defective_curve(client):
@@ -362,6 +396,44 @@ def test_review_blocked_by_defective_curve(client):
     bolt3 = next(b for b in detail["curve_review"]["bolts"] if b["bolt_no"] == 3)
     assert bolt3["state"] == "unusable"
     assert bolt3["defects"][0]["interval"]["point_index"] == 40  # 具体区间随结论返回
+
+
+def test_review_blocked_by_below_min_readings(client):
+    """回归：每栓轨迹含 10 个低于量程下限的样点 → 全部不可用，review 阻断。
+
+    旧式 0 起步曲线（0→320 N·m 线性）点 0..9 扭矩 0~45 N·m < 量程下限 50；
+    修复前这类轨迹被误判可用，八栓 review 会错误进入 reviewed。
+    """
+    pid = make_completed(client)
+    ids = final_record_ids(client, pid)
+    legacy = [{"t": i * 0.02, "torque": 320.0 * i / 64, "angle": 90.0 * i / 64}
+              for i in range(65)]
+    for bolt, rec_id in ids.items():
+        r = submit(client, pid, rec_id, legacy)
+        assert r.status_code == 201  # 缺陷轨迹照常落库，标记不可用
+        assert r.json()["usable"] is False
+        defect = r.json()["analysis"]["defects"][0]
+        assert defect["reason"] == D_OUT_OF_RANGE
+        iv = defect["interval"]
+        assert (iv["start_index"], iv["end_index"]) == (0, 9)
+        assert iv["min_torque_nm"] == 0.0
+        assert iv["tool_range_min_nm"] == 50.0
+
+    r = client.post(f"/procedures/{pid}/review", json={"reviewer": "李四"})
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["reason"] == "curve_review_failed"
+    assert detail["blockers"] == ["curve_unusable"]
+    assert detail["curve_review"]["unusable_bolts"] == list(range(1, 9))
+    assert client.get(f"/procedures/{pid}").json()["procedure"]["status"] == "completed"
+
+    # 换用全部样点在量程内的曲线后 review 通过
+    for c in client.get(f"/procedures/{pid}/curves").json()["curves"]:
+        r = client.post(f"/curves/{c['curve_id']}/amend", json={
+            "reason": "更换为量程内有效采样曲线", "points": good_curve()})
+        assert r.status_code == 201 and r.json()["usable"] is True
+    assert client.post(f"/procedures/{pid}/review",
+                       json={"reviewer": "李四"}).status_code == 200
 
 
 def test_outlier_rate_gate(client):
@@ -395,7 +467,7 @@ def test_amend_moves_snug_point_keeps_history(client):
     ids = final_record_ids(client, pid)
     r = submit(client, pid, ids[5], good_curve())
     cid = r.json()["curve_id"]
-    assert r.json()["analysis"]["post_snug_angle_deg"] == pytest.approx(78.75)
+    assert r.json()["analysis"]["post_snug_angle_deg"] == pytest.approx(90.0)
 
     r = client.post(f"/curves/{cid}/amend", json={
         "reason": "设备自动贴合点偏晚，人工核对后移至第 20 点", "snug_index": 20})
@@ -405,12 +477,12 @@ def test_amend_moves_snug_point_keeps_history(client):
     assert a["snug_source"] == "manual" and a["snug_index"] == 20
     assert a["post_snug_angle_deg"] == pytest.approx(61.875)
 
-    # 旧轨迹保持可查：首修订仍为自动贴合点 78.75°
+    # 旧轨迹保持可查：首修订仍为自动贴合点 90°
     detail = client.get(f"/curves/{cid}").json()
     assert [rev["revision"] for rev in detail["revisions"]] == [1, 2]
     rev1, rev2 = detail["revisions"]
     assert rev1["analysis"]["snug_source"] == "auto"
-    assert rev1["analysis"]["post_snug_angle_deg"] == pytest.approx(78.75)
+    assert rev1["analysis"]["post_snug_angle_deg"] == pytest.approx(90.0)
     assert rev1["amendment_note"] is None
     assert "人工核对" in rev2["amendment_note"]
     assert rev2["snug_override"] == 20
