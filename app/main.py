@@ -12,10 +12,13 @@ from pydantic import ValidationError
 from .alignment import analyze_alignment, diff_analyses
 from .curve import analyze_curve, evaluate_curve_review
 from .db import get_conn, init_db, utcnow
+from .planning import (PlanInfeasible, default_min_separation, expand_angles,
+                       schedule_plan)
 from .rules import find_infeasible_rounds, validate_report
 from .schemas import (AlignmentCheckCreate, BaselineRequest, CurveAmend, CurveSubmit,
                       DeriveRequest, ExcludeRequest, MeasurementBatchCreate,
-                      RemeasurementRequest, RetestRequest, ProcedureCreate, ReviewRequest,
+                      PlanRevisionCreate, RemeasurementRequest, RetestRequest,
+                      ProcedureCreate, ReviewRequest, SiteConstraintsInput,
                       TorqueReport)
 from .sequencing import build_plan, sequence_violations
 from .svg import render_svg
@@ -96,9 +99,159 @@ def _locked_bolts(conn: sqlite3.Connection, pid: int) -> set[int]:
     return set(json.loads(row["locked_bolts"])) if row else set()
 
 
+# ---------------------------------------------------------------- 受限栓位施工计划
+
+def _latest_constraints(conn: sqlite3.Connection, pid: int) -> dict | None:
+    """最新现场约束（草稿可改、批准冻结、plan-revisions 派生新版）。"""
+    row = conn.execute(
+        "SELECT * FROM site_constraints WHERE procedure_id=? ORDER BY revision DESC",
+        (pid,)).fetchone()
+    if row is None:
+        return None
+    return {"revision": row["revision"], "input": json.loads(row["payload"]),
+            "created_at": row["created_at"]}
+
+
+def _current_plan(conn: sqlite3.Connection, pid: int) -> dict | None:
+    """当前冻结计划（最新计划修订）；未批准时为 None。"""
+    row = conn.execute(
+        "SELECT * FROM plan_revisions WHERE procedure_id=? ORDER BY revision DESC",
+        (pid,)).fetchone()
+    if row is None:
+        return None
+    payload = json.loads(row["plan"])
+    return {"revision": row["revision"], "constraint_revision": row["constraint_revision"],
+            "change_note": row["change_note"], "created_at": row["created_at"],
+            "steps": payload["steps"], "actions": payload["actions"],
+            "meta": payload.get("meta") or {}}
+
+
+def _constraint_bolt_errors(proc: dict, ci: dict) -> list[int]:
+    """现场约束中超出 1..N 的栓号（PUT 改小 bolt_count 后旧约束可能失效）。"""
+    return [b["bolt_no"] for b in ci["bolts"]
+            if not (1 <= b["bolt_no"] <= proc["bolt_count"])]
+
+
+def _parse_windows(wins: list[dict]) -> list[tuple[datetime, datetime]]:
+    return [(datetime.fromisoformat(w["start"]), datetime.fromisoformat(w["end"]))
+            for w in wins or []]
+
+
+def _run_planner(proc: dict, ci: dict, *, locked_steps: list[dict] | tuple = (),
+                 locked_bolts: set[int] | frozenset[int] = frozenset()):
+    """用现场约束跑规划器（纯函数）；约束栓号越界时抛 409。"""
+    bad = _constraint_bolt_errors(proc, ci)
+    if bad:
+        raise HTTPException(409, detail={
+            "reason": "constraints_bolt_out_of_range",
+            "message": f"现场约束登记的栓号 {bad} 超出当前工艺螺栓数 "
+                       f"{proc['bolt_count']}；请修正后重新登记",
+            "bolt_nos": bad,
+        })
+    overrides = {b["bolt_no"]: b.get("angle_deg") for b in ci["bolts"]}
+    angles = expand_angles(proc["bolt_count"], proc["start_angle_deg"],
+                           bool(proc["clockwise"]), overrides)
+    tool_windows: dict[str, list] = {}
+    for tw in ci["tool_windows"]:
+        tool_windows.setdefault(tw["tool_id"], []).append(
+            (datetime.fromisoformat(tw["start"]), datetime.fromisoformat(tw["end"])))
+    by_bolt = {b["bolt_no"]: b for b in ci["bolts"]}
+    from .planning import BoltSite
+    sites = {}
+    for k in range(1, proc["bolt_count"] + 1):
+        c = by_bolt.get(k) or {}
+        sites[k] = BoltSite(
+            bolt_no=k, angle_deg=angles[k],
+            windows=_parse_windows(c.get("windows") or []),
+            allowed_tools=c.get("allowed_tools") or [proc["tool_id"]],
+            clearance_deg=c.get("clearance_deg") or 0.0,
+        )
+    return schedule_plan(
+        bolt_count=proc["bolt_count"], stage_ratios=proc["stage_ratios"],
+        target_torque=proc["target_torque"], sites=sites,
+        min_separation_deg=ci.get("min_separation_deg"),
+        step_minutes=ci.get("step_minutes", 5.0),
+        tool_change_minutes=ci.get("tool_change_minutes", 2.0),
+        shift_start=datetime.fromisoformat(ci["shift_start"]),
+        tool_windows=tool_windows, default_tool=proc["tool_id"],
+        locked_steps=locked_steps, locked_bolts=locked_bolts)
+
+
+def _default_steps(proc: dict, locked: set[int]) -> list[dict]:
+    """规则圆周计划（无现场约束）：交叉序列 + 计划字段默认值。"""
+    angles = expand_angles(proc["bolt_count"], proc["start_angle_deg"],
+                           bool(proc["clockwise"]))
+    steps = build_plan(proc["bolt_count"], proc["target_torque"],
+                       proc["stage_ratios"], locked)
+    for s in steps:
+        s["tool_id"] = proc["tool_id"]
+        s["scheduled_at"] = None
+        s["angle_deg"] = angles[s["bolt_no"]]
+    return steps
+
+
 def _proc_plan(conn: sqlite3.Connection, proc: dict) -> list[dict]:
-    return build_plan(proc["bolt_count"], proc["target_torque"],
-                      proc["stage_ratios"], _locked_bolts(conn, proc["id"]))
+    """当前生效计划：已冻结读冻结版本；草稿有约束给规划器预览，否则规则圆周。"""
+    frozen = _current_plan(conn, proc["id"])
+    if frozen is not None:
+        return frozen["steps"]
+    cons = _latest_constraints(conn, proc["id"])
+    if cons is not None:
+        try:
+            steps, _ = _run_planner(proc, cons["input"],
+                                    locked_bolts=_locked_bolts(conn, proc["id"]))
+            return steps
+        except PlanInfeasible:
+            return []  # 预览不可行：空计划，诊断见 plan_status
+    return _default_steps(proc, _locked_bolts(conn, proc["id"]))
+
+
+def _plan_status(conn: sqlite3.Connection, proc: dict) -> dict:
+    """计划可行性视图：冻结版本号或草稿预览诊断。"""
+    frozen = _current_plan(conn, proc["id"])
+    if frozen is not None:
+        return {"feasible": True, "frozen": True, "revision": frozen["revision"],
+                "constraint_revision": frozen["constraint_revision"]}
+    cons = _latest_constraints(conn, proc["id"])
+    if cons is not None:
+        try:
+            _run_planner(proc, cons["input"],
+                         locked_bolts=_locked_bolts(conn, proc["id"]))
+            return {"feasible": True, "frozen": False, "revision": None,
+                    "constraint_revision": cons["revision"]}
+        except PlanInfeasible as exc:
+            return {"feasible": False, "frozen": False, "revision": None,
+                    "constraint_revision": cons["revision"],
+                    "diagnosis": exc.as_detail()}
+    return {"feasible": True, "frozen": False, "revision": None,
+            "constraint_revision": None}
+
+
+def _freeze_plan(conn: sqlite3.Connection, proc: dict) -> None:
+    """批准时冻结计划 v1：有约束跑规划器（无解即 409），否则规则圆周。"""
+    if _current_plan(conn, proc["id"]) is not None:
+        return
+    locked = _locked_bolts(conn, proc["id"])
+    cons = _latest_constraints(conn, proc["id"])
+    if cons is not None:
+        try:
+            steps, actions = _run_planner(proc, cons["input"], locked_bolts=locked)
+        except PlanInfeasible as exc:
+            raise HTTPException(409, detail=exc.as_detail())
+        payload = {"steps": steps, "actions": actions,
+                   "meta": {"constraint_revision": cons["revision"],
+                            "generated_at": utcnow()}}
+        cons_rev = cons["revision"]
+    else:
+        payload = {"steps": _default_steps(proc, locked), "actions": [],
+                   "meta": {"generated_at": utcnow()}}
+        cons_rev = None
+    conn.execute(
+        "INSERT INTO plan_revisions"
+        " (procedure_id, revision, constraint_revision, plan, change_note, created_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (proc["id"], 1, cons_rev, json.dumps(payload), "批准冻结", utcnow()))
+    conn.commit()
 
 
 def _insert_proc(conn: sqlite3.Connection, data: ProcedureCreate, *,
@@ -177,17 +330,22 @@ def _progress_view(proc: dict, done: list[dict], plan: list[dict]) -> dict:
 
 
 def _preflight(conn: sqlite3.Connection, proc: dict) -> None:
-    """批准/开工前校验：交叉序列可实现，且每轮允许区间与工具量程有交集。"""
+    """批准/开工前校验：交叉序列可实现，且每轮允许区间与工具量程有交集。
+
+    登记现场约束后顺序由规划器按实际方位生成（批准时冻结），规则圆周的
+    交叉序列可实现性检查不再适用；量程预检与对中门禁不变。
+    """
     locked = _locked_bolts(conn, proc["id"])
-    violations = sequence_violations(proc["bolt_count"], locked)
-    if violations:
-        pairs = "、".join(f"{a}→{b}" for a, b in violations)
-        raise HTTPException(409, detail={
-            "reason": "sequence_not_realizable",
-            "message": f"{proc['bolt_count']} 栓法兰无法生成满足同轮非相邻规则的交叉序列"
-                       f"（相邻步骤：{pairs}），拒绝推进；请调整螺栓数量或工艺规则",
-            "adjacent_pairs": [list(p) for p in violations],
-        })
+    if _latest_constraints(conn, proc["id"]) is None:
+        violations = sequence_violations(proc["bolt_count"], locked)
+        if violations:
+            pairs = "、".join(f"{a}→{b}" for a, b in violations)
+            raise HTTPException(409, detail={
+                "reason": "sequence_not_realizable",
+                "message": f"{proc['bolt_count']} 栓法兰无法生成满足同轮非相邻规则的交叉序列"
+                           f"（相邻步骤：{pairs}），拒绝推进；请调整螺栓数量或工艺规则",
+                "adjacent_pairs": [list(p) for p in violations],
+            })
     conflicts = find_infeasible_rounds(
         proc["target_torque"], proc["stage_ratios"], proc["tolerance_pct"],
         proc["tool_range_min"], proc["tool_range_max"])
@@ -311,7 +469,9 @@ def get_procedure(pid: int, conn: sqlite3.Connection = Depends(get_db)):
     proc = _fetch_proc(conn, pid)
     plan = _proc_plan(conn, proc)
     done = _done_records(conn, pid)
-    return {"procedure": proc, "plan": plan, "progress": _progress_view(proc, done, plan)}
+    return {"procedure": proc, "plan": plan,
+            "plan_status": _plan_status(conn, proc),
+            "progress": _progress_view(proc, done, plan)}
 
 
 @app.put("/procedures/{pid}")
@@ -341,11 +501,12 @@ def update_draft(pid: int, data: ProcedureCreate, conn: sqlite3.Connection = Dep
 
 @app.post("/procedures/{pid}/approve")
 def approve(pid: int, conn: sqlite3.Connection = Depends(get_db)):
-    """批准：锁定全部参数；批准前校验序列可实现性与每轮可行区间。"""
+    """批准：锁定全部参数并冻结施工计划；批准前校验序列可实现性与每轮可行区间。"""
     proc = _fetch_proc(conn, pid)
     if proc["status"] != "draft":
         raise HTTPException(409, f"工艺 {pid} 当前状态 {proc['status']}，须为 draft 才能批准")
     _preflight(conn, proc)
+    _freeze_plan(conn, proc)  # 登记现场约束时规划器无解即 409 plan_infeasible
     return {"procedure": _transition(conn, pid, "draft", "approved", "approved_at")}
 
 
@@ -434,7 +595,12 @@ def derive(pid: int, body: DeriveRequest, conn: sqlite3.Connection = Depends(get
 def submit_report(pid: int, report: TorqueReport, conn: sqlite3.Connection = Depends(get_db)):
     """逐栓回传。任一规则不满足即拒绝推进、记录异常并指出涉事螺栓。"""
     proc = _fetch_proc(conn, pid)
-    proc_for_rules = {**proc, "locked_bolts": _locked_bolts(conn, pid)}
+    frozen_plan = _current_plan(conn, pid)
+    proc_for_rules = {
+        **proc, "locked_bolts": _locked_bolts(conn, pid),
+        # 现场计划已按实际方位排定角间隔：跳过规则圆周的栓号相邻检查
+        "site_plan": bool(frozen_plan and frozen_plan["constraint_revision"] is not None),
+    }
     plan = _proc_plan(conn, proc)
     done = _done_records(conn, pid)
 
@@ -494,7 +660,7 @@ def submit_report(pid: int, report: TorqueReport, conn: sqlite3.Connection = Dep
 
 @app.get("/procedures/{pid}/resume")
 def resume(pid: int, conn: sqlite3.Connection = Depends(get_db)):
-    """作业中断后依据已完成位置给出恢复序列。"""
+    """作业中断后依据已完成位置给出恢复序列（与作业包同一冻结计划）。"""
     proc = _fetch_proc(conn, pid)
     plan = _proc_plan(conn, proc)
     done = _done_records(conn, pid)
@@ -502,6 +668,178 @@ def resume(pid: int, conn: sqlite3.Connection = Depends(get_db)):
         **_progress_view(proc, done, plan),
         "resume_sequence": plan[len(done):],
     }
+
+
+# ---------------------------------------------------------------- 受限栓位施工规划
+
+def _constraints_view(proc: dict, cons: dict) -> dict:
+    """约束展开视图：每栓实际方位（登记/展开）、时间窗、允许工具与角区。"""
+    ci = cons["input"]
+    overrides = {b["bolt_no"]: b.get("angle_deg") for b in ci["bolts"]}
+    angles = expand_angles(proc["bolt_count"], proc["start_angle_deg"],
+                           bool(proc["clockwise"]), overrides)
+    by_bolt = {b["bolt_no"]: b for b in ci["bolts"]}
+    bolts = []
+    for k in range(1, proc["bolt_count"] + 1):
+        c = by_bolt.get(k) or {}
+        bolts.append({
+            "bolt_no": k,
+            "angle_deg": angles[k],
+            "angle_source": "registered" if c.get("angle_deg") is not None else "computed",
+            "windows": c.get("windows") or [],
+            "allowed_tools": c.get("allowed_tools") or [proc["tool_id"]],
+            "clearance_deg": c.get("clearance_deg") or 0.0,
+        })
+    return {
+        "shift_start": ci["shift_start"],
+        "min_separation_deg": (ci.get("min_separation_deg")
+                               or default_min_separation(proc["bolt_count"])),
+        "step_minutes": ci.get("step_minutes", 5.0),
+        "tool_change_minutes": ci.get("tool_change_minutes", 2.0),
+        "tool_windows": ci["tool_windows"],
+        "bolts": bolts,
+    }
+
+
+@app.put("/procedures/{pid}/constraints")
+def put_constraints(pid: int, body: SiteConstraintsInput,
+                    conn: sqlite3.Connection = Depends(get_db)):
+    """草稿登记/替换现场约束（整组另存新版本，旧版本保留）。
+
+    批准后约束随计划冻结；现场障碍或工具变化须 POST plan-revisions 派生修订。
+    """
+    proc = _fetch_proc(conn, pid)
+    if proc["status"] != "draft":
+        raise HTTPException(409, detail={
+            "reason": "constraints_locked",
+            "message": f"工艺 {pid} 当前状态 {proc['status']}：现场约束已随批准计划冻结；"
+                       "现场障碍或工具变化须从批准版派生计划修订"
+                       "（POST /procedures/{id}/plan-revisions），只重排未完成步骤",
+        })
+    ci = json.loads(body.model_dump_json())
+    bad = _constraint_bolt_errors(proc, ci)
+    if bad:
+        raise HTTPException(422, detail={
+            "reason": "unknown_bolt",
+            "message": f"栓号 {bad} 超出范围（共 {proc['bolt_count']} 栓）",
+            "bolt_nos": bad,
+        })
+    row = conn.execute(
+        "SELECT MAX(revision) r FROM site_constraints WHERE procedure_id=?",
+        (pid,)).fetchone()
+    rev = (row["r"] or 0) + 1
+    conn.execute(
+        "INSERT INTO site_constraints (procedure_id, revision, payload, created_at)"
+        " VALUES (?,?,?,?)", (pid, rev, json.dumps(ci), utcnow()))
+    conn.commit()
+    proc = _fetch_proc(conn, pid)
+    return {"procedure_id": pid, "revision": rev, "constraints": ci,
+            "expanded": _constraints_view(proc, {"input": ci}),
+            "preview": _plan_status(conn, proc)}
+
+
+@app.get("/procedures/{pid}/constraints")
+def get_constraints(pid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """当前现场约束与展开视图（含规划器预览可行性诊断）。"""
+    proc = _fetch_proc(conn, pid)
+    cons = _latest_constraints(conn, pid)
+    if cons is None:
+        return {"procedure_id": pid, "revision": None, "constraints": None,
+                "expanded": None, "preview": _plan_status(conn, proc)}
+    return {"procedure_id": pid, "revision": cons["revision"],
+            "constraints": cons["input"],
+            "expanded": _constraints_view(proc, cons),
+            "preview": _plan_status(conn, proc)}
+
+
+@app.post("/procedures/{pid}/plan-revisions", status_code=201)
+def create_plan_revision(pid: int, body: PlanRevisionCreate,
+                         conn: sqlite3.Connection = Depends(get_db)):
+    """现场障碍或工具变化：从批准版派生计划修订，只重排未完成步骤。
+
+    已完成步骤按原时刻/工具/轮内次序锁定；无解即 409 并给出首个冲突轮次、
+    受阻栓位与最少需解除的限制，当前冻结计划不受影响。
+    """
+    proc = _fetch_proc(conn, pid)
+    if proc["status"] not in ("approved", "in_progress"):
+        raise HTTPException(409, detail={
+            "reason": "plan_revision_window",
+            "message": f"工艺 {pid} 当前状态 {proc['status']}：计划修订须从批准版"
+                       "（approved/in_progress）派生；草稿请直接 PUT constraints",
+        })
+    ci = json.loads(body.constraints.model_dump_json())
+    bad = _constraint_bolt_errors(proc, ci)
+    if bad:
+        raise HTTPException(422, detail={
+            "reason": "unknown_bolt",
+            "message": f"栓号 {bad} 超出范围（共 {proc['bolt_count']} 栓）",
+            "bolt_nos": bad,
+        })
+    frozen = _current_plan(conn, pid)
+    if frozen is None:  # 兼容旧库：批准时未冻结的计划现场补冻结
+        _freeze_plan(conn, proc)
+        frozen = _current_plan(conn, pid)
+    done = _done_records(conn, pid)
+    locked_steps = frozen["steps"][:len(done)]  # 执行严格按序：已完成即计划前缀
+    try:
+        steps, actions = _run_planner(
+            proc, ci, locked_steps=locked_steps,
+            locked_bolts=_locked_bolts(conn, pid))
+    except PlanInfeasible as exc:
+        raise HTTPException(409, detail=exc.as_detail())
+
+    row = conn.execute(
+        "SELECT MAX(revision) r FROM site_constraints WHERE procedure_id=?",
+        (pid,)).fetchone()
+    cons_rev = (row["r"] or 0) + 1
+    conn.execute(
+        "INSERT INTO site_constraints (procedure_id, revision, payload, created_at)"
+        " VALUES (?,?,?,?)", (pid, cons_rev, json.dumps(ci), utcnow()))
+    plan_rev = frozen["revision"] + 1
+    payload = {"steps": steps, "actions": actions,
+               "meta": {"constraint_revision": cons_rev,
+                        "locked_steps": len(locked_steps),
+                        "generated_at": utcnow()}}
+    conn.execute(
+        "INSERT INTO plan_revisions"
+        " (procedure_id, revision, constraint_revision, plan, change_note, created_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (pid, plan_rev, cons_rev, json.dumps(payload), body.change_note, utcnow()))
+    conn.commit()
+    return {
+        "procedure_id": pid,
+        "revision": plan_rev,
+        "constraint_revision": cons_rev,
+        "change_note": body.change_note,
+        "locked_steps": len(locked_steps),
+        "rescheduled_steps": len(steps) - len(locked_steps),
+        "steps": steps,
+        "actions": actions,
+        "message": f"计划修订 v{plan_rev} 已冻结：已完成 {len(locked_steps)} 步原位锁定，"
+                   f"其余 {len(steps) - len(locked_steps)} 步按新现场约束重排；"
+                   "恢复序列、作业包与圆周图即时切换为同一冻结计划",
+    }
+
+
+@app.get("/procedures/{pid}/plan-revisions")
+def list_plan_revisions(pid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """计划修订链（批准冻结 v1 起，逐版保留）。"""
+    _fetch_proc(conn, pid)
+    rows = conn.execute(
+        "SELECT * FROM plan_revisions WHERE procedure_id=? ORDER BY revision",
+        (pid,)).fetchall()
+    out = []
+    for r in rows:
+        payload = json.loads(r["plan"])
+        out.append({
+            "revision": r["revision"],
+            "constraint_revision": r["constraint_revision"],
+            "change_note": r["change_note"],
+            "step_count": len(payload["steps"]),
+            "actions": payload["actions"],
+            "created_at": r["created_at"],
+        })
+    return {"procedure_id": pid, "plan_revisions": out}
 
 
 # ---------------------------------------------------------------- 扭矩-转角轨迹
@@ -837,10 +1175,16 @@ def job_package(pid: int, conn: sqlite3.Connection = Depends(get_db)):
         "SELECT * FROM anomalies WHERE procedure_id=? ORDER BY id", (pid,)).fetchall()]
     done = [r for r in records if r["rework_of"] is None]
     alignment = _adopted_alignment(conn, pid)
+    frozen = _current_plan(conn, pid)
     return {
         "procedure": proc,
         "progress": _progress_view(proc, done, plan),
         "plan": plan,
+        "planning": {
+            "status": _plan_status(conn, proc),
+            "actions": frozen["actions"] if frozen else [],
+            "meta": frozen["meta"] if frozen else None,
+        },
         "records": records,
         "anomalies": anomalies,
         "revisions": _revision_chain(conn, pid),
@@ -853,7 +1197,7 @@ def job_package(pid: int, conn: sqlite3.Connection = Depends(get_db)):
 
 @app.get("/procedures/{pid}/diagram.svg")
 def diagram(pid: int, conn: sqlite3.Connection = Depends(get_db)):
-    """圆周示意 SVG：方位、完成轮次、下一栓、异常、补拧与轨迹复核标记。"""
+    """圆周示意 SVG：实际方位、完成轮次、下一栓、异常、补拧、计划动作与轨迹标记。"""
     proc = _fetch_proc(conn, pid)
     plan = _proc_plan(conn, proc)
     records = _all_records(conn, pid)
@@ -864,8 +1208,23 @@ def diagram(pid: int, conn: sqlite3.Connection = Depends(get_db)):
     alignment = _adopted_alignment(conn, pid)
     measurement = _measurement_reference(conn, pid)
     curves = _curve_review(conn, proc)
+    # 与 JSON 作业包同一冻结计划：栓位取计划实际方位，动作为计划等待/换工具
+    angles = expand_angles(proc["bolt_count"], proc["start_angle_deg"],
+                           bool(proc["clockwise"]))
+    for s in plan:
+        if s.get("angle_deg") is not None:
+            angles[s["bolt_no"]] = s["angle_deg"]
+    frozen = _current_plan(conn, pid)
+    actions = frozen["actions"] if frozen else []
+    clearances: dict[int, float] = {}
+    cons = _latest_constraints(conn, pid)
+    if cons is not None:
+        for b in cons["input"]["bolts"]:
+            if b.get("clearance_deg"):
+                clearances[b["bolt_no"]] = b["clearance_deg"]
     svg = render_svg(proc, plan, records, anomalies, next_step, measurement, curves,
-                     alignment)
+                     alignment, plan_angles=angles, plan_actions=actions,
+                     clearances=clearances)
     return Response(content=svg, media_type="image/svg+xml")
 
 

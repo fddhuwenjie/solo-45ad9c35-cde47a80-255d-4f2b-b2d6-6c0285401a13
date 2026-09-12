@@ -113,6 +113,86 @@ class DeriveRequest(BaseModel):
     max_outlier_rate_pct: float | None = None
 
 
+# ---------------------------------------------------------------- 受限栓位施工规划
+
+class TimeWindow(BaseModel):
+    """一段可操作/可用时间窗（ISO 8601，结束须晚于开始）。"""
+
+    start: datetime = Field(..., description="窗口开始时刻")
+    end: datetime = Field(..., description="窗口结束时刻")
+
+    @model_validator(mode="after")
+    def _check_window(self) -> "TimeWindow":
+        if self.end <= self.start:
+            raise ValueError("时间窗结束时刻须晚于开始时刻")
+        return self
+
+
+class ToolWindow(TimeWindow):
+    """工具可用时段（工具可能被其他作业占用）。"""
+
+    tool_id: str = Field(..., min_length=1, description="工具编号")
+
+
+class BoltSiteInput(BaseModel):
+    """单栓现场约束：实际方位、可操作时间窗、允许工具与套筒/反力臂角区。
+
+    未登记的字段取默认：方位按规则圆周展开；无时间窗限制；仅批准工具；
+    角区 0（不考虑套筒/反力臂占位）。
+    """
+
+    bolt_no: int = Field(..., ge=1, description="螺栓编号 1..N")
+    angle_deg: float | None = Field(
+        None, description="实际方位角（0=正上方，顺时针为正）；缺省按规则圆周展开")
+    windows: list[TimeWindow] = Field(
+        default_factory=list, description="可操作时间窗；空 = 全时段可操作")
+    allowed_tools: list[str] | None = Field(
+        None, description="允许工具编号列表；缺省 = 仅批准工具")
+    clearance_deg: float = Field(
+        0.0, ge=0.0, le=180.0,
+        description="套筒/反力臂所需角区半宽（度，自栓位向两侧延伸）")
+
+    @field_validator("allowed_tools")
+    @classmethod
+    def _check_tools(cls, v: list[str] | None) -> list[str] | None:
+        if v is not None:
+            if not v:
+                raise ValueError("允许工具列表不能为空；不限制请省略该字段")
+            if any(not t.strip() for t in v):
+                raise ValueError("允许工具编号不能为空字符串")
+        return v
+
+
+class SiteConstraintsInput(BaseModel):
+    """现场约束整组登记（草稿可改，批准随计划冻结；变化须派生计划修订）。"""
+
+    shift_start: datetime = Field(..., description="排程起点（当班开始时刻）")
+    min_separation_deg: float | None = Field(
+        None, gt=0, le=180,
+        description="同轮连续两步最小角间隔（度）；缺省复现同轮非相邻规则（360/N）")
+    step_minutes: float = Field(5.0, gt=0, description="单栓紧固作业时长（分钟）")
+    tool_change_minutes: float = Field(2.0, ge=0, description="换工具耗时（分钟）")
+    tool_windows: list[ToolWindow] = Field(
+        default_factory=list, description="工具可用时段；未登记的工具全时段可用")
+    bolts: list[BoltSiteInput] = Field(
+        default_factory=list, description="逐栓现场约束（未登记栓位取默认值）")
+
+    @field_validator("bolts")
+    @classmethod
+    def _check_unique_bolts(cls, v: list[BoltSiteInput]) -> list[BoltSiteInput]:
+        nos = [b.bolt_no for b in v]
+        if len(nos) != len(set(nos)):
+            raise ValueError("同一螺栓只能登记一次现场约束")
+        return v
+
+
+class PlanRevisionCreate(BaseModel):
+    """现场障碍或工具变化时从批准版派生计划修订：只重排未完成步骤。"""
+
+    change_note: str = Field(..., min_length=1, description="变更说明（写入计划修订链）")
+    constraints: SiteConstraintsInput = Field(..., description="完整的新现场约束（整体替换）")
+
+
 # ---------------------------------------------------------------- 超声伸长复核
 
 class MeasurementBatchCreate(BaseModel):

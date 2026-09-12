@@ -49,10 +49,15 @@ def render_svg(proc: dict, plan: list[dict], records: list[dict],
                anomalies: list[dict], next_step: dict | None,
                measurement: dict | None = None,
                curve_review: dict | None = None,
-               alignment: dict | None = None) -> str:
+               alignment: dict | None = None,
+               plan_angles: dict[int, float] | None = None,
+               plan_actions: list[dict] | None = None,
+               clearances: dict[int, float] | None = None) -> str:
     n = proc["bolt_count"]
     rounds = len(proc["stage_ratios"])
     cx, cy, r = 340.0, 410.0, 210.0
+    plan_actions = plan_actions or []
+    clearances = clearances or {}
 
     rounds_done: dict[int, int] = {}
     rework_bolts: set[int] = set()
@@ -103,9 +108,21 @@ def render_svg(proc: dict, plan: list[dict], records: list[dict],
         if len(defect_lines) > 6:
             defect_lines = defect_lines[:6] + ["……其余缺陷区间见 JSON 作业包"]
 
-    # 底部清单行数决定画布高度（图例/说明三行 + 缺陷清单）
+    # 底部清单行数决定画布高度（图例/说明三行 + 缺陷清单 + 计划动作清单）
     width = 680.0
-    height = 866.0 + 18.0 * len(defect_lines)
+    action_lines: list[str] = []
+    for a in plan_actions[:4]:
+        if a["kind"] == "wait":
+            action_lines.append(
+                f'等待 {a["minutes"]} 分钟（{a["from"][11:16]}→{a["until"][11:16]}）：'
+                f'{a["reason"]}')
+        elif a["kind"] == "tool_change":
+            action_lines.append(
+                f'换工具 {a["from_tool"]}→{a["to_tool"]} @{a["at"][11:16]}'
+                f'（{a["minutes"]} 分钟）')
+    if len(plan_actions) > 4:
+        action_lines.append(f'……其余 {len(plan_actions) - 4} 个动作见 JSON 作业包')
+    height = 866.0 + 18.0 * (len(defect_lines) + len(action_lines))
 
     header2 = (
         f'工具：{escape(proc["tool_id"])}（量程 {proc["tool_range_min"]}~'
@@ -222,7 +239,22 @@ def render_svg(proc: dict, plan: list[dict], records: list[dict],
                 f'stroke="#343a40" stroke-width="0.8"/>')
 
     for bolt in range(1, n + 1):
-        x, yb = _bolt_xy(bolt - 1, n, cx, cy, r, proc["start_angle_deg"], bool(proc["clockwise"]))
+        if plan_angles is not None:
+            x, yb = _angle_xy(plan_angles[bolt], cx, cy, r)
+        else:
+            x, yb = _bolt_xy(bolt - 1, n, cx, cy, r, proc["start_angle_deg"],
+                             bool(proc["clockwise"]))
+        clr = clearances.get(bolt)
+        if clr and plan_angles is not None:
+            a0 = math.radians(plan_angles[bolt] - clr)
+            a1 = math.radians(plan_angles[bolt] + clr)
+            arc_r = r + 8.0
+            x0, y0 = cx + arc_r * math.sin(a0), cy - arc_r * math.cos(a0)
+            x1, y1 = cx + arc_r * math.sin(a1), cy - arc_r * math.cos(a1)
+            large = 1 if 2 * clr > 180 else 0
+            parts.append(f'<path d="M {x0:.1f} {y0:.1f} A {arc_r:.0f} {arc_r:.0f} 0 '
+                         f'{large} 1 {x1:.1f} {y1:.1f}" fill="none" stroke="#b08900" '
+                         f'stroke-width="2" stroke-dasharray="5 3"/>')
         done = rounds_done.get(bolt, 0)
         fill = _FILL_DONE if done >= rounds else (_FILL_PARTIAL if done > 0 else _FILL_PENDING)
         if bolt == next_bolt:
@@ -240,8 +272,11 @@ def render_svg(proc: dict, plan: list[dict], records: list[dict],
                      f'stroke="#343a40" stroke-width="1.5"/>')
         parts.append(f'<text x="{x:.1f}" y="{yb + 4:.1f}" text-anchor="middle" font-size="12" '
                      f'fill="#6c757d">{order_of.get(bolt, "—")}</text>')
-        lx, ly = _bolt_xy(bolt - 1, n, cx, cy, r + 44, proc["start_angle_deg"],
-                          bool(proc["clockwise"]))
+        if plan_angles is not None:
+            lx, ly = _angle_xy(plan_angles[bolt], cx, cy, r + 44)
+        else:
+            lx, ly = _bolt_xy(bolt - 1, n, cx, cy, r + 44, proc["start_angle_deg"],
+                              bool(proc["clockwise"]))
         parts.append(f'<text x="{lx:.1f}" y="{ly + 5:.1f}" text-anchor="middle" font-size="15" '
                      f'font-weight="bold" fill="#212529">{bolt}</text>')
         if done or bolt in rework_bolts:
@@ -325,7 +360,7 @@ def render_svg(proc: dict, plan: list[dict], records: list[dict],
     parts.append(f'<text x="{cx:.0f}" y="{note_y}" text-anchor="middle" font-size="11" '
                  f'fill="#868e96">圆点内数字为轮内紧固次序；外侧粗体为螺栓编号；'
                  f'法兰圆外侧菱形为对中预检测点（红=缺口/螺栓不能自由穿入）；'
-                 f'螺栓旁为超声换算预紧力</text>')
+                 f'螺栓旁为超声换算预紧力；黄褐虚线弧为套筒/反力臂所需角区</text>')
     parts.append(f'<text x="{cx:.0f}" y="{note_y + 18}" text-anchor="middle" font-size="11" '
                  f'fill="#868e96">本图与 JSON 作业包引用同一预检版本与测点'
                  + (f'：对中预检 v{alignment["version"]}' if alignment else "（尚无对中预检）")
@@ -338,6 +373,13 @@ def render_svg(proc: dict, plan: list[dict], records: list[dict],
                      f'fill="{_CURVE_COLORS["unusable"]}">轨迹缺陷区间（不得进入复核结论）：</text>')
         for i, line in enumerate(defect_lines):
             parts.append(f'<text x="86" y="{dy + 18 + 18 * i}" font-size="11" '
+                         f'fill="#495057">{escape(line)}</text>')
+    if action_lines:
+        ay = note_y + 44 + 18 * len(defect_lines)
+        parts.append(f'<text x="70" y="{ay}" font-size="12" font-weight="bold" '
+                     f'fill="#b08900">施工计划动作（与作业包同一冻结计划）：</text>')
+        for i, line in enumerate(action_lines):
+            parts.append(f'<text x="86" y="{ay + 18 + 18 * i}" font-size="11" '
                          f'fill="#495057">{escape(line)}</text>')
     parts.append("</svg>")
     return "\n".join(parts)

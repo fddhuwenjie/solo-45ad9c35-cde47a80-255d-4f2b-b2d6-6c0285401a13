@@ -112,12 +112,20 @@ def validate_report(
             report.bolt_no,
         )
 
-    # 批准版本锁定工具：更换工具须派生新版本
-    if report.tool_id != proc["tool_id"]:
+    # 计划步骤锁定工具：现场计划可为不同栓位安排不同工具（换工具动作）；
+    # 无现场计划时即批准工具
+    if report.rework_of is not None and rework_origin is not None:
+        step = next((s for s in plan
+                     if s["round_no"] == rework_origin["round_no"]
+                     and s["bolt_no"] == report.bolt_no), None)
+    else:
+        step = plan[len(done)] if len(done) < len(plan) else None
+    expected_tool = (step or {}).get("tool_id") or proc["tool_id"]
+    if report.tool_id != expected_tool:
         return Rejection(
             "tool_mismatch",
-            f"回传工具 {report.tool_id} 与批准工具 {proc['tool_id']} 不一致；"
-            "更换工具须派生新版本",
+            f"回传工具 {report.tool_id} 与计划步骤锁定工具 {expected_tool} 不一致；"
+            "更换工具须派生新版本，现场工具变化须派生计划修订",
             report.bolt_no,
         )
 
@@ -195,8 +203,9 @@ def validate_report(
             expected["bolt_no"],
         )
 
-    # 同轮连续紧固相邻螺栓（无豁免：4 栓配置在批准/开工前即被拒绝）
-    if done and done[-1]["round_no"] == current_round:
+    # 同轮连续紧固相邻螺栓（现场计划由规划器按实际方位保证角间隔，
+    # 不再套用规则圆周的栓号相邻规则；无现场计划时该检查不变）
+    if done and done[-1]["round_no"] == current_round and not proc.get("site_plan"):
         prev_bolt = done[-1]["bolt_no"]
         if circular_distance(prev_bolt, report.bolt_no, proc["bolt_count"]) == 1:
             return Rejection(
