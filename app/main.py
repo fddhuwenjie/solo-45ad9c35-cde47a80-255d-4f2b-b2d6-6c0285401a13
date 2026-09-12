@@ -859,12 +859,56 @@ def derive_rework(bid: int, conn: sqlite3.Connection = Depends(get_db)):
             "message": "仅开放（未确认）批次可派生补拧",
         })
     detail = _batch_detail(conn, batch)
-    bolts = detail["verdict"]["bolts"]
-    # 已继承的锁定合格结果始终保留；补拧范围内仅锁定本次仍然合格的螺栓
-    good = sorted({b["bolt_no"] for b in bolts
-                   if not b["gaps"] and b["in_target_band"]}
-                  | set(batch["locked_bolts"]))
-    targets = [x for x in batch["scope_bolts"] if x not in good]
+    verdict = detail["verdict"]
+    bolts = verdict["bolts"]
+    scope_set = set(batch["scope_bolts"])
+    inherited_locked = set(batch["locked_bolts"])
+
+    # 1) 证据缺口 / 超出目标预紧力带的范围螺栓必须补拧；
+    #    继承的锁定合格螺栓始终保留。
+    target_reasons: dict[int, list[str]] = {}
+    for b in bolts:
+        bolt = b["bolt_no"]
+        if bolt not in scope_set:
+            continue
+        if b["gaps"]:
+            target_reasons[bolt] = ["evidence_gap"]
+        elif not b["in_target_band"]:
+            target_reasons[bolt] = ["load_out_of_target_band"]
+    good = (scope_set - set(target_reasons)) | inherited_locked
+
+    # 2) 对径不平衡超限：补拧只能增大预紧力，故应补拧该对中载荷较小的
+    #    一栓向对侧靠拢；该栓须可作业（在补拧范围、非继承锁定）。
+    unaddressable: list[dict] = []
+    for d in verdict["diametral_imbalance"]:
+        imb = d["imbalance_pct"]
+        if imb is None or imb <= batch["max_imbalance_pct"]:
+            continue
+        fa, fb = d["load_a_kn"], d["load_b_kn"]
+        if fa is None or fb is None:
+            continue
+        pick = d["bolt_a"] if fa <= fb else d["bolt_b"]
+        if pick not in scope_set or pick in inherited_locked:
+            # 较小载荷栓已锁定/不在范围：补拧另一栓只会加剧不平衡，
+            # 扭矩补拧不可修正，须松退重紧或解除锁定，显式拒绝。
+            unaddressable.append({"bolt_a": d["bolt_a"], "bolt_b": d["bolt_b"],
+                                  "load_a_kn": fa, "load_b_kn": fb,
+                                  "imbalance_pct": imb})
+            continue
+        target_reasons.setdefault(pick, []).append(
+            f"diametral_imbalance:{d['bolt_a']}/{d['bolt_b']}={imb}%"
+            f">{batch['max_imbalance_pct']}%")
+        good.discard(pick)
+
+    targets = [x for x in batch["scope_bolts"] if x in target_reasons]
+    good = sorted(good)
+    if not targets and unaddressable:
+        raise HTTPException(409, detail={
+            "reason": "rework_uncorrectable_imbalance",
+            "message": "存在对径不平衡，但较低载荷栓已锁定合格（补拧只能增大载荷，"
+                       "拧紧对侧会加剧不平衡）；请松退重紧相关螺栓或调整锁定集合后再派生",
+            "pairs": unaddressable,
+        })
     if not targets:
         raise HTTPException(409, detail={
             "reason": "nothing_to_rework",
@@ -906,6 +950,7 @@ def derive_rework(bid: int, conn: sqlite3.Connection = Depends(get_db)):
         "source_batch_id": bid,
         "locked_bolts": good,
         "target_bolts": targets,
+        "rework_reasons": {str(k): v for k, v in target_reasons.items()},
         "locked_results": locked_snapshot,
         "plan": _proc_plan(conn, new_proc),
         "message": "补拧草稿已生成（末轮 100%）；批准、开工、回传后按同一冻结参数"

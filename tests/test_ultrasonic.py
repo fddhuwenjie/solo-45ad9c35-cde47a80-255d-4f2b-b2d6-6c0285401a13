@@ -576,3 +576,79 @@ def test_rework_plan_respects_cross_sequence(client):
     assert r.json()["target_bolts"] == [3, 7]
     assert [s["bolt_no"] for s in r.json()["plan"]] == [3, 7]
     assert [s["order_in_round"] for s in r.json()["plan"]] == [1, 2]
+
+
+def test_imbalance_only_failure_derives_rework(client):
+    """回归：各栓均在目标带 120~160 kN 内，仅 1/5 对径不平衡 28.57% 超限。
+
+    旧逻辑只按逐栓目标带选补拧栓 -> 误报 nothing_to_rework；
+    新逻辑须选出较低载荷栓 1（120 kN）补拧，锁定其余 7 栓。
+    """
+    pid = make_approved(client)
+    bid = make_batch(client, pid)
+    baselines_all(client, bid)
+    start_and_complete(client, pid)
+    loads = {b: 140.0 for b in range(1, 9)}
+    loads[1] = 120.0  # 1 号栓目标带下沿
+    loads[5] = 160.0  # 对径 5 号栓目标带上沿 -> 不平衡 |120-160|/140 = 28.5714%
+    list(readings_all(client, bid, loads))
+
+    # 确认失败：唯一阻断因素是对径不平衡（无证据缺口、无超目标带）
+    r = client.post(f"/measurement-batches/{bid}/confirm")
+    assert r.status_code == 409
+    assert r.json()["detail"]["blockers"] == ["diametral_imbalance"]
+    pair_15 = [d for d in r.json()["detail"]["verdict"]["diametral_imbalance"]
+               if d["bolt_a"] == 1][0]
+    assert pair_15["imbalance_pct"] == pytest.approx(28.5714, abs=1e-4)
+
+    # 派生补拧：不再 nothing_to_rework，较低载荷栓 1 被选中
+    r = client.post(f"/measurement-batches/{bid}/derive-rework")
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["target_bolts"] == [1]
+    assert body["locked_bolts"] == [2, 3, 4, 5, 6, 7, 8]
+    assert "1" in body["rework_reasons"]
+    assert any("diametral_imbalance:1/5" in rsn
+               for rsn in body["rework_reasons"]["1"])
+    assert [s["bolt_no"] for s in body["plan"]] == [1]
+
+
+def test_imbalance_picks_lower_bolt_and_full_rework_chain(client):
+    """2/6 对 125 vs 155（21.4%）：补拧 2 号栓到带内中部后整圈复核通过。"""
+    pid = make_approved(client)
+    bid = make_batch(client, pid)
+    baselines_all(client, bid)
+    start_and_complete(client, pid)
+    loads = {b: 140.0 for b in range(1, 9)}
+    loads[2], loads[6] = 125.0, 155.0
+    list(readings_all(client, bid, loads))
+    r = client.post(f"/measurement-batches/{bid}/derive-rework")
+    assert r.status_code == 201
+    assert r.json()["target_bolts"] == [2]
+
+    rw_pid = r.json()["rework_procedure"]["id"]
+    client.post(f"/procedures/{rw_pid}/approve")
+    client.post(f"/procedures/{rw_pid}/start")
+
+    # 补拧前（in_progress）建立批次并采集补拧栓基线
+    r = client.post(f"/procedures/{rw_pid}/measurement-batches", json=BATCH)
+    rbid = r.json()["batch"]["id"]
+    assert r.json()["batch"]["scope_bolts"] == [2]
+    assert client.post(f"/measurement-batches/{rbid}/baselines",
+                       json={"bolt_no": 2, "tof_s": TOF0}).status_code == 201
+
+    # 末轮补拧
+    rep = client.post(f"/procedures/{rw_pid}/reports", json={
+        "bolt_no": 2, "tool_id": "TW-1001", "operator": "张三",
+        "reported_at": "2026-09-12T15:00:00", "measured_torque": 320.0})
+    assert rep.status_code == 201 and rep.json()["status"] == "completed"
+
+    r = client.post(f"/measurement-batches/{rbid}/readings", json={
+        "bolt_no": 2, "tof_s": tof_for_load(140.0), "temperature_c": 20.0,
+        "operator": "赵六", "measured_at": "2026-09-12T15:20:00"})
+    assert r.status_code == 201 and r.json()["valid"] is True
+    v = client.get(f"/measurement-batches/{rbid}").json()["verdict"]
+    # 2 号栓补拧到 140，与 6 号（155）不平衡 10.17% < 15%，全部入带 -> 可确认
+    assert v["confirmed"] is True
+    assert v["blockers"] == []
+    assert client.post(f"/measurement-batches/{rbid}/confirm").status_code == 200
