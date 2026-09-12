@@ -1,0 +1,14 @@
+{
+  "flange_class": "PN40 DN200",
+  "bolt_count": 8,
+  "gasket": "缠绕垫片 304+石墨",
+  "target_torque": 320.0,
+  "stage_ratios": [0.3, 0.6, 1.0],
+  "tolerance_pct": 5.0,
+  "tool_id": "TW-1001",
+  "tool_range_min": 50.0,
+  "tool_range_max": 500.0,
+  "calibration_valid_until": "2026-12-31",
+  "start_angle_deg": 0.0,
+  "clockwise": true
+}

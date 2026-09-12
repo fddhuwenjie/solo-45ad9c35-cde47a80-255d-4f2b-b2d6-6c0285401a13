@@ -1,0 +1,7 @@
+{
+  "bolt_no": 5,
+  "tool_id": "TW-1001",
+  "operator": "张三",
+  "reported_at": "2027-01-05T09:10:00",
+  "measured_torque": 96.0
+}

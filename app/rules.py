@@ -1,0 +1,160 @@
+"""回传校验规则（纯函数，便于单测）。
+
+任一规则不满足即拒绝推进并指出涉事螺栓；所有拒绝由路由层写入 anomalies。
+校验顺序：状态 -> 栓号合法 -> 工具一致 -> 校准有效期 -> 量程 ->
+（补拧分支 | 跳步/同轮重复 -> 同轮相邻 -> 扭矩超差）。
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date
+
+from .sequencing import circular_distance
+from .schemas import TorqueReport
+
+
+@dataclass
+class Rejection:
+    reason: str
+    message: str
+    bolt_no: int | None
+    expected_bolt_no: int | None = None
+
+    def as_detail(self) -> dict:
+        return {
+            "reason": self.reason,
+            "message": self.message,
+            "bolt_no": self.bolt_no,
+            "expected_bolt_no": self.expected_bolt_no,
+        }
+
+
+def _check_tolerance(proc: dict, report: TorqueReport, target: float) -> Rejection | None:
+    dev_pct = abs(report.measured_torque - target) / target * 100
+    if dev_pct > proc["tolerance_pct"]:
+        return Rejection(
+            "torque_out_of_tolerance",
+            f"螺栓 {report.bolt_no} 实测 {report.measured_torque} N·m，"
+            f"目标 {target} N·m，偏差 {dev_pct:.2f}% 超过允许 ±{proc['tolerance_pct']}%",
+            report.bolt_no,
+        )
+    return None
+
+
+def validate_report(
+    proc: dict,
+    plan: list[dict],
+    done: list[dict],
+    report: TorqueReport,
+    rework_origin: dict | None = None,
+) -> Rejection | None:
+    """校验一条回传。proc 中 calibration_valid_until 须为 date，stage_ratios 为 list。"""
+    status = proc["status"]
+
+    if status == "archived":
+        return Rejection("archived", "工艺已封存，禁止任何回传", report.bolt_no)
+    if status in ("draft", "approved"):
+        return Rejection("not_started", f"工艺状态为 {status}，尚未开工，禁止回传", report.bolt_no)
+
+    if not (1 <= report.bolt_no <= proc["bolt_count"]):
+        return Rejection(
+            "unknown_bolt",
+            f"螺栓 {report.bolt_no} 不存在（共 {proc['bolt_count']} 栓）",
+            report.bolt_no,
+        )
+
+    # 批准版本锁定工具：更换工具须派生新版本
+    if report.tool_id != proc["tool_id"]:
+        return Rejection(
+            "tool_mismatch",
+            f"回传工具 {report.tool_id} 与批准工具 {proc['tool_id']} 不一致；"
+            "更换工具须派生新版本",
+            report.bolt_no,
+        )
+
+    # 校准有效期（含当日）
+    valid_until: date = proc["calibration_valid_until"]
+    if report.reported_at.date() > valid_until:
+        return Rejection(
+            "calibration_expired",
+            f"工具 {report.tool_id} 校准有效期至 {valid_until}，"
+            f"回传时刻 {report.reported_at.date()} 已过期，作业无效",
+            report.bolt_no,
+        )
+
+    # 工具越量程：量程内读数才有效
+    if not (proc["tool_range_min"] <= report.measured_torque <= proc["tool_range_max"]):
+        return Rejection(
+            "tool_out_of_range",
+            f"实测扭矩 {report.measured_torque} N·m 超出工具量程 "
+            f"[{proc['tool_range_min']}, {proc['tool_range_max']}] N·m",
+            report.bolt_no,
+        )
+
+    # ---- 补拧分支：不推进顺序、不覆盖原记录 ----
+    if report.rework_of is not None:
+        if rework_origin is None:
+            return Rejection(
+                "rework_target_missing",
+                f"补拧指向的原记录 {report.rework_of} 不存在",
+                report.bolt_no,
+            )
+        if rework_origin["bolt_no"] != report.bolt_no:
+            return Rejection(
+                "rework_bolt_mismatch",
+                f"补拧螺栓 {report.bolt_no} 与原记录螺栓 "
+                f"{rework_origin['bolt_no']} 不一致",
+                report.bolt_no,
+            )
+        target = round(
+            proc["target_torque"] * proc["stage_ratios"][rework_origin["round_no"] - 1], 2
+        )
+        return _check_tolerance(proc, report, target)
+
+    # ---- 正常推进分支 ----
+    if status != "in_progress":
+        return Rejection(
+            "not_in_progress",
+            f"工艺状态为 {status}，常规回传须处于 in_progress；如需补拧请指定 rework_of",
+            report.bolt_no,
+        )
+
+    progress = len(done)
+    if progress >= len(plan):
+        return Rejection("already_complete", "全部螺栓各轮次均已完成", report.bolt_no)
+
+    expected = plan[progress]
+    current_round = expected["round_no"]
+
+    # 同一螺栓在本轮已有记录
+    if any(r["round_no"] == current_round and r["bolt_no"] == report.bolt_no for r in done):
+        return Rejection(
+            "duplicate_in_round",
+            f"螺栓 {report.bolt_no} 在第 {current_round} 轮已有记录，禁止重复回传；"
+            "如需补拧请指定 rework_of 指向原记录",
+            report.bolt_no,
+            expected["bolt_no"],
+        )
+
+    # 跳步：必须严格按计划顺序推进
+    if report.bolt_no != expected["bolt_no"]:
+        return Rejection(
+            "out_of_sequence",
+            f"跳步：第 {current_round} 轮下一栓应为 {expected['bolt_no']}"
+            f"（轮内第 {expected['order_in_round']} 位），实际回传 {report.bolt_no}",
+            report.bolt_no,
+            expected["bolt_no"],
+        )
+
+    # 同轮连续紧固相邻螺栓（n=4 数学上不可避免，豁免）
+    if proc["bolt_count"] > 4 and done and done[-1]["round_no"] == current_round:
+        prev_bolt = done[-1]["bolt_no"]
+        if circular_distance(prev_bolt, report.bolt_no, proc["bolt_count"]) == 1:
+            return Rejection(
+                "adjacent_in_round",
+                f"螺栓 {report.bolt_no} 与上一栓 {prev_bolt} 同轮相邻，"
+                "禁止同轮连续紧固相邻螺栓",
+                report.bolt_no,
+            )
+
+    return _check_tolerance(proc, report, expected["target_torque"])
