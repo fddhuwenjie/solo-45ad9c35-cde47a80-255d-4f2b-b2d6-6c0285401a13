@@ -102,6 +102,16 @@ def validate_report(
             report.bolt_no,
         )
 
+    # 补拧批次：锁定的合格螺栓不再作业，也不接受补拧回传
+    locked = proc.get("locked_bolts") or set()
+    if report.bolt_no in locked:
+        return Rejection(
+            "bolt_locked",
+            f"螺栓 {report.bolt_no} 在补拧作业包中已锁定为合格，禁止重新紧固；"
+            "如需变更须另行派生工艺",
+            report.bolt_no,
+        )
+
     # 批准版本锁定工具：更换工具须派生新版本
     if report.tool_id != proc["tool_id"]:
         return Rejection(

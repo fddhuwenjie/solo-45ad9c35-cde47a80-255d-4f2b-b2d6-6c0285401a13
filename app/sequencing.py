@@ -25,18 +25,24 @@ def circular_distance(a: int, b: int, n: int) -> int:
     return min(d, n - d)
 
 
-def sequence_violations(n: int) -> list[tuple[int, int]]:
+def sequence_violations(n: int, locked: set[int] | None = None) -> list[tuple[int, int]]:
     """返回交叉序列中圆周相邻的连续步骤对；空列表表示满足同轮非相邻约束。
 
     仅 n = 4 会出现违规（序列 1-3-2-4 中 3->2 相邻），用于批准/开工前拒绝该配置。
+    locked 给出补拧锁定螺栓：它们从交叉序列中剔除后，剩余连续步骤须同样非相邻。
     """
-    seq = cross_sequence(n)
+    seq = [b for b in cross_sequence(n) if not locked or b not in locked]
     return [(a, b) for a, b in zip(seq, seq[1:]) if circular_distance(a, b, n) == 1]
 
 
-def build_plan(bolt_count: int, target_torque: float, stage_ratios: list[float]) -> list[dict]:
-    """按分轮递增规则生成稳定计划：每轮所有螺栓按交叉顺序紧固到该轮比例。"""
-    seq = cross_sequence(bolt_count)
+def build_plan(bolt_count: int, target_torque: float, stage_ratios: list[float],
+               locked: set[int] | None = None) -> list[dict]:
+    """按分轮递增规则生成稳定计划：每轮所有螺栓按交叉顺序紧固到该轮比例。
+
+    locked 中的螺栓在补拧批次中已锁定合格，不生成计划步骤；其余螺栓保持
+    原有交叉顺序（补拧只做末轮，stage_ratios 由派生批次冻结为 [1.0]）。
+    """
+    seq = [b for b in cross_sequence(bolt_count) if not locked or b not in locked]
     plan: list[dict] = []
     for round_no, ratio in enumerate(stage_ratios, start=1):
         for order_in_round, bolt_no in enumerate(seq, start=1):

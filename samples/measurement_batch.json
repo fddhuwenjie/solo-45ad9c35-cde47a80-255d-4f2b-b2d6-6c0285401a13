@@ -1,0 +1,16 @@
+{
+  "length_mm": 150.0,
+  "area_mm2": 353.0,
+  "elastic_modulus_mpa": 206000.0,
+  "sound_velocity": 5900.0,
+  "temp_coefficient": -0.0001,
+  "reference_temp_c": 20.0,
+  "temp_comp_min_c": 0.0,
+  "temp_comp_max_c": 60.0,
+  "target_load_min_kn": 120.0,
+  "target_load_max_kn": 160.0,
+  "material_load_limit_kn": 180.0,
+  "max_imbalance_pct": 15.0,
+  "instrument_id": "US-77",
+  "instrument_calibration_until": "2026-12-31"
+}

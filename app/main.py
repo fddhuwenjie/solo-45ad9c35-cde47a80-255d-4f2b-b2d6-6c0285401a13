@@ -4,17 +4,19 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from pydantic import ValidationError
 
 from .db import get_conn, init_db, utcnow
 from .rules import find_infeasible_rounds, validate_report
-from .schemas import DeriveRequest, ProcedureCreate, ReviewRequest, TorqueReport
+from .schemas import (BaselineRequest, DeriveRequest, ExcludeRequest,
+                      MeasurementBatchCreate, RemeasurementRequest, RetestRequest,
+                      ProcedureCreate, ReviewRequest, TorqueReport)
 from .sequencing import build_plan, sequence_violations
 from .svg import render_svg
-
+from .ultrasonic import GAP_MESSAGES, evaluate_batch, evaluate_reading
 STATUS_LABEL = {
     "draft": "已创建",
     "approved": "已批准",
@@ -83,6 +85,19 @@ def _all_records(conn: sqlite3.Connection, pid: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _locked_bolts(conn: sqlite3.Connection, pid: int) -> set[int]:
+    """补拧派生工艺锁定（不补拧、沿用合格结果）的螺栓；普通工艺为空集。"""
+    row = conn.execute(
+        "SELECT locked_bolts FROM rework_jobs WHERE rework_procedure_id=?", (pid,)
+    ).fetchone()
+    return set(json.loads(row["locked_bolts"])) if row else set()
+
+
+def _proc_plan(conn: sqlite3.Connection, proc: dict) -> list[dict]:
+    return build_plan(proc["bolt_count"], proc["target_torque"],
+                      proc["stage_ratios"], _locked_bolts(conn, proc["id"]))
+
+
 def _insert_proc(conn: sqlite3.Connection, data: ProcedureCreate, *,
                  version: int = 1, parent_id: int | None = None,
                  change_note: str | None = None) -> int:
@@ -102,6 +117,19 @@ def _insert_proc(conn: sqlite3.Connection, data: ProcedureCreate, *,
     )
     conn.commit()
     return cur.lastrowid
+
+
+def _proc_as_create(proc: dict, *, stage_ratios: list[float] | None = None) -> ProcedureCreate:
+    """把（已批准）工艺参数重新装配为 ProcedureCreate，供派生/补拧草稿使用。"""
+    return ProcedureCreate(
+        flange_class=proc["flange_class"], bolt_count=proc["bolt_count"],
+        gasket=proc["gasket"], target_torque=proc["target_torque"],
+        stage_ratios=stage_ratios or proc["stage_ratios"],
+        tolerance_pct=proc["tolerance_pct"], tool_id=proc["tool_id"],
+        tool_range_min=proc["tool_range_min"], tool_range_max=proc["tool_range_max"],
+        calibration_valid_until=proc["calibration_valid_until"],
+        start_angle_deg=proc["start_angle_deg"], clockwise=proc["clockwise"],
+    )
 
 
 def _transition(conn: sqlite3.Connection, pid: int, expect: str, new: str,
@@ -133,9 +161,10 @@ def _progress_view(proc: dict, done: list[dict], plan: list[dict]) -> dict:
     }
 
 
-def _preflight(proc: dict) -> None:
+def _preflight(conn: sqlite3.Connection, proc: dict) -> None:
     """批准/开工前校验：交叉序列可实现，且每轮允许区间与工具量程有交集。"""
-    violations = sequence_violations(proc["bolt_count"])
+    locked = _locked_bolts(conn, proc["id"])
+    violations = sequence_violations(proc["bolt_count"], locked)
     if violations:
         pairs = "、".join(f"{a}→{b}" for a, b in violations)
         raise HTTPException(409, detail={
@@ -165,7 +194,7 @@ def create_procedure(data: ProcedureCreate, conn: sqlite3.Connection = Depends(g
     """创建工艺（草稿），同时生成稳定的分轮交叉紧固计划。"""
     pid = _insert_proc(conn, data)
     proc = _fetch_proc(conn, pid)
-    plan = build_plan(proc["bolt_count"], proc["target_torque"], proc["stage_ratios"])
+    plan = _proc_plan(conn, proc)
     return {"procedure": proc, "plan": plan}
 
 
@@ -181,7 +210,7 @@ def list_procedures(conn: sqlite3.Connection = Depends(get_db)):
 @app.get("/procedures/{pid}")
 def get_procedure(pid: int, conn: sqlite3.Connection = Depends(get_db)):
     proc = _fetch_proc(conn, pid)
-    plan = build_plan(proc["bolt_count"], proc["target_torque"], proc["stage_ratios"])
+    plan = _proc_plan(conn, proc)
     done = _done_records(conn, pid)
     return {"procedure": proc, "plan": plan, "progress": _progress_view(proc, done, plan)}
 
@@ -211,7 +240,7 @@ def approve(pid: int, conn: sqlite3.Connection = Depends(get_db)):
     proc = _fetch_proc(conn, pid)
     if proc["status"] != "draft":
         raise HTTPException(409, f"工艺 {pid} 当前状态 {proc['status']}，须为 draft 才能批准")
-    _preflight(proc)
+    _preflight(conn, proc)
     return {"procedure": _transition(conn, pid, "draft", "approved", "approved_at")}
 
 
@@ -221,7 +250,7 @@ def start(pid: int, conn: sqlite3.Connection = Depends(get_db)):
     proc = _fetch_proc(conn, pid)
     if proc["status"] != "approved":
         raise HTTPException(409, f"工艺 {pid} 当前状态 {proc['status']}，须为 approved 才能开工")
-    _preflight(proc)
+    _preflight(conn, proc)
     return {"procedure": _transition(conn, pid, "approved", "in_progress", "started_at")}
 
 
@@ -272,7 +301,8 @@ def derive(pid: int, body: DeriveRequest, conn: sqlite3.Connection = Depends(get
 def submit_report(pid: int, report: TorqueReport, conn: sqlite3.Connection = Depends(get_db)):
     """逐栓回传。任一规则不满足即拒绝推进、记录异常并指出涉事螺栓。"""
     proc = _fetch_proc(conn, pid)
-    plan = build_plan(proc["bolt_count"], proc["target_torque"], proc["stage_ratios"])
+    proc_for_rules = {**proc, "locked_bolts": _locked_bolts(conn, pid)}
+    plan = _proc_plan(conn, proc)
     done = _done_records(conn, pid)
 
     rework_origin = None
@@ -283,7 +313,7 @@ def submit_report(pid: int, report: TorqueReport, conn: sqlite3.Connection = Dep
         ).fetchone()
         rework_origin = dict(row) if row else None
 
-    rejection = validate_report(proc, plan, done, report, rework_origin)
+    rejection = validate_report(proc_for_rules, plan, done, report, rework_origin)
     if rejection is not None:
         conn.execute(
             "INSERT INTO anomalies (procedure_id, bolt_no, reason, message, payload, created_at)"
@@ -333,7 +363,7 @@ def submit_report(pid: int, report: TorqueReport, conn: sqlite3.Connection = Dep
 def resume(pid: int, conn: sqlite3.Connection = Depends(get_db)):
     """作业中断后依据已完成位置给出恢复序列。"""
     proc = _fetch_proc(conn, pid)
-    plan = build_plan(proc["bolt_count"], proc["target_torque"], proc["stage_ratios"])
+    plan = _proc_plan(conn, proc)
     done = _done_records(conn, pid)
     return {
         **_progress_view(proc, done, plan),
@@ -367,7 +397,7 @@ def _revision_chain(conn: sqlite3.Connection, pid: int) -> dict:
 def job_package(pid: int, conn: sqlite3.Connection = Depends(get_db)):
     """JSON 作业包：计划、实测、异常与修订链。"""
     proc = _fetch_proc(conn, pid)
-    plan = build_plan(proc["bolt_count"], proc["target_torque"], proc["stage_ratios"])
+    plan = _proc_plan(conn, proc)
     records = _all_records(conn, pid)
     anomalies = [dict(r) for r in conn.execute(
         "SELECT * FROM anomalies WHERE procedure_id=? ORDER BY id", (pid,)).fetchall()]
@@ -379,6 +409,7 @@ def job_package(pid: int, conn: sqlite3.Connection = Depends(get_db)):
         "records": records,
         "anomalies": anomalies,
         "revisions": _revision_chain(conn, pid),
+        "measurement": _measurement_reference(conn, pid),
         "generated_at": utcnow(),
     }
 
@@ -387,11 +418,496 @@ def job_package(pid: int, conn: sqlite3.Connection = Depends(get_db)):
 def diagram(pid: int, conn: sqlite3.Connection = Depends(get_db)):
     """圆周示意 SVG：方位、完成轮次、下一栓、异常与补拧标记。"""
     proc = _fetch_proc(conn, pid)
-    plan = build_plan(proc["bolt_count"], proc["target_torque"], proc["stage_ratios"])
+    plan = _proc_plan(conn, proc)
     records = _all_records(conn, pid)
     anomalies = [dict(r) for r in conn.execute(
         "SELECT bolt_no FROM anomalies WHERE procedure_id=?", (pid,)).fetchall()]
     done = [r for r in records if r["rework_of"] is None]
     next_step = plan[len(done)] if len(done) < len(plan) else None
-    svg = render_svg(proc, plan, records, anomalies, next_step)
+    measurement = _measurement_reference(conn, pid)
+    svg = render_svg(proc, plan, records, anomalies, next_step, measurement)
     return Response(content=svg, media_type="image/svg+xml")
+
+
+# ---------------------------------------------------------------- 超声伸长复核
+
+# 允许建立测量批次 / 提交基线的工艺状态
+BATCH_CREATABLE = ("approved", "in_progress", "completed", "reviewed", "archived")
+BASELINE_STATUSES = ("approved", "in_progress")
+REMEASURE_STATUSES = ("completed", "reviewed")
+
+
+def _row_to_batch(row: sqlite3.Row) -> dict:
+    b = dict(row)
+    for key in ("scope_bolts", "locked_bolts", "locked_results"):
+        b[key] = json.loads(b[key]) if b[key] else ([] if key != "locked_results" else {})
+    return b
+
+
+def _fetch_batch(conn: sqlite3.Connection, bid: int) -> dict:
+    row = conn.execute("SELECT * FROM measurement_batches WHERE id=?", (bid,)).fetchone()
+    if row is None:
+        raise HTTPException(404, f"测量批次 {bid} 不存在")
+    return _row_to_batch(row)
+
+
+def _batch_evals(conn: sqlite3.Connection, batch: dict) -> tuple[list[dict], list[dict]]:
+    baselines = [dict(r) for r in conn.execute(
+        "SELECT * FROM measurement_baselines WHERE batch_id=? ORDER BY bolt_no",
+        (batch["id"],)).fetchall()]
+    readings = [dict(r) for r in conn.execute(
+        "SELECT * FROM measurement_readings WHERE batch_id=? ORDER BY id",
+        (batch["id"],)).fetchall()]
+    return baselines, readings
+
+
+def _verdict_payload(batch: dict, verdict) -> dict:
+    return {
+        "confirmed": verdict.confirmed,
+        "blockers": verdict.blockers,
+        "target_load_band_kn": list(verdict.target_band),
+        "dispersion_cv_pct": verdict.dispersion_cv_pct,
+        "max_deviation_pct": verdict.max_deviation_pct,
+        "max_imbalance_pct": verdict.max_imbalance_pct,
+        "imbalance_limit_pct": verdict.imbalance_limit_pct,
+        "diametral_imbalance": verdict.diametral,
+        "bolts": verdict.bolt_results,
+        "evidence_gaps": [
+            {"bolt_no": g["bolt_no"],
+             "reasons": g["reasons"],
+             "messages": [GAP_MESSAGES.get(r, r) for r in g["reasons"]]}
+            for g in verdict.gaps
+        ],
+    }
+
+
+def _batch_detail(conn: sqlite3.Connection, batch: dict) -> dict:
+    proc = _fetch_proc(conn, batch["procedure_id"])
+    frozen = {**batch, "bolt_count": proc["bolt_count"]}
+    baselines, readings = _batch_evals(conn, batch)
+    verdict = evaluate_batch(frozen, baselines, readings)
+    out_band = [
+        r["bolt_no"] for r in verdict.bolt_results
+        if not r["gaps"] and not r["in_target_band"]
+    ]
+    return {
+        "batch": batch,
+        "procedure_id": batch["procedure_id"],
+        "procedure_status": proc["status"],
+        "baselines": [{k: b[k] for k in ("bolt_no", "tof_s", "created_at")} for b in baselines],
+        "readings": [
+            {k: (bool(r[k]) if k == "excluded" else r[k])
+             for k in ("id", "bolt_no", "tof_s", "temperature_c", "operator",
+                       "measured_at", "supersedes", "excluded", "amendment_note",
+                       "created_at")}
+            for r in readings
+        ],
+        "baseline_complete": len(baselines) == len(batch["scope_bolts"]),
+        "verdict": _verdict_payload(batch, verdict),
+        "out_of_band_bolts": out_band,
+    }
+
+
+def _record_gap(conn: sqlite3.Connection, batch: dict, bolt_no: int, reasons: list[str],
+                payload: dict) -> None:
+    for reason in reasons:
+        conn.execute(
+            "INSERT INTO measurement_gaps"
+            " (batch_id, revision, bolt_no, reason, message, payload, created_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (batch["id"], batch["revision"], bolt_no, reason,
+             GAP_MESSAGES.get(reason, reason), json.dumps(payload), utcnow()),
+        )
+
+
+def _require_batch_open(batch: dict) -> None:
+    if batch["status"] == "confirmed":
+        raise HTTPException(409, detail={
+            "reason": "batch_confirmed",
+            "message": f"测量批次 {batch['id']} 已确认（修订 {batch['confirmed_revision']}），"
+                       "只读；新测量须另建批次",
+        })
+    if batch["status"] == "superseded":
+        raise HTTPException(409, detail={
+            "reason": "batch_superseded",
+            "message": f"测量批次 {batch['id']} 已派生补拧批次而废止，只读",
+        })
+
+
+def _measurement_reference(conn: sqlite3.Connection, pid: int) -> dict | None:
+    rows = conn.execute(
+        "SELECT * FROM measurement_batches WHERE procedure_id=? ORDER BY id", (pid,)
+    ).fetchall()
+    if not rows:
+        return None
+    batches = [_row_to_batch(r) for r in rows]
+    confirmed = [b for b in batches if b["status"] == "confirmed"]
+    if confirmed:
+        b = confirmed[-1]
+    else:
+        open_batches = [b for b in batches if b["status"] == "open"]
+        if not open_batches:
+            return None
+        b = open_batches[-1]
+    baselines, readings = _batch_evals(conn, b)
+    proc = _fetch_proc(conn, pid)
+    frozen = {**b, "bolt_count": proc["bolt_count"]}
+    verdict = evaluate_batch(frozen, baselines, readings)
+    return {
+        "batch_id": b["id"],
+        "revision": b["revision"],
+        "status": b["status"],
+        "confirmed_revision": b["confirmed_revision"],
+        "instrument_id": b["instrument_id"],
+        "target_load_band_kn": [b["target_load_min_kn"], b["target_load_max_kn"]],
+        "verdict": _verdict_payload(b, verdict),
+    }
+
+
+@app.post("/procedures/{pid}/measurement-batches", status_code=201)
+def create_measurement_batch(pid: int, data: MeasurementBatchCreate,
+                             conn: sqlite3.Connection = Depends(get_db)):
+    """从 approved（及以后）工艺建立超声测量批次，冻结螺栓/材料/仪器参数。"""
+    proc = _fetch_proc(conn, pid)
+    if proc["status"] not in BATCH_CREATABLE:
+        raise HTTPException(409, detail={
+            "reason": "not_approvable_for_measurement",
+            "message": f"工艺 {pid} 当前状态 {proc['status']}，须经批准（approved）后才能"
+                       "建立测量批次",
+        })
+
+    # 补拧工艺：沿用上一批冻结参数与锁定螺栓；仍须显式提交全部冻结字段以核对
+    rw = conn.execute(
+        "SELECT * FROM rework_jobs WHERE rework_procedure_id=?", (pid,)).fetchone()
+    derived_from = None
+    locked_bolts: list[int] = []
+    locked_results: dict = {}
+    scope: list[int] = list(range(1, proc["bolt_count"] + 1))
+    if rw is not None:
+        source = _fetch_batch(conn, rw["source_batch_id"])
+        derived_from = source["id"]
+        locked_bolts = json.loads(rw["locked_bolts"])
+        scope = json.loads(rw["target_bolts"])
+        # 锁定栓合格结果快照：源批次整圈结论中的锁定栓（含源批次自己继承的锁定栓）
+        source_bolts = _batch_detail(conn, source)["verdict"]["bolts"]
+        locked_results = {
+            str(b["bolt_no"]): b for b in source_bolts if b["bolt_no"] in locked_bolts
+        }
+
+    open_row = conn.execute(
+        "SELECT id FROM measurement_batches WHERE procedure_id=? AND status='open'",
+        (pid,)).fetchone()
+    if open_row is not None:
+        raise HTTPException(409, detail={
+            "reason": "open_batch_exists",
+            "message": f"工艺 {pid} 已有开放测量批次 {open_row['id']}；确认或废止后才能新建",
+            "batch_id": open_row["id"],
+        })
+
+    cur = conn.execute(
+        """INSERT INTO measurement_batches
+           (procedure_id, revision, status, scope_bolts, locked_bolts, locked_results,
+            length_mm, area_mm2, elastic_modulus_mpa, sound_velocity, temp_coefficient,
+            reference_temp_c, temp_comp_min_c, temp_comp_max_c, target_load_min_kn,
+            target_load_max_kn, material_load_limit_kn, max_imbalance_pct, instrument_id,
+            instrument_calibration_until, derived_from_batch_id, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (pid, 1, "open", json.dumps(scope), json.dumps(locked_bolts),
+         json.dumps(locked_results) if locked_results else None,
+         data.length_mm, data.area_mm2, data.elastic_modulus_mpa, data.sound_velocity,
+         data.temp_coefficient, data.reference_temp_c, data.temp_comp_min_c,
+         data.temp_comp_max_c, data.target_load_min_kn, data.target_load_max_kn,
+         data.material_load_limit_kn, data.max_imbalance_pct, data.instrument_id,
+         data.instrument_calibration_until.isoformat(), derived_from, utcnow()),
+    )
+    conn.commit()
+    batch = _fetch_batch(conn, cur.lastrowid)
+    return {"batch": batch, "frozen": _batch_detail(conn, batch)}
+
+
+@app.get("/procedures/{pid}/measurement-batches")
+def list_measurement_batches(pid: int, conn: sqlite3.Connection = Depends(get_db)):
+    _fetch_proc(conn, pid)
+    rows = conn.execute(
+        "SELECT * FROM measurement_batches WHERE procedure_id=? ORDER BY id",
+        (pid,)).fetchall()
+    return [_row_to_batch(r) for r in rows]
+
+
+@app.get("/measurement-batches/{bid}")
+def get_measurement_batch(bid: int, conn: sqlite3.Connection = Depends(get_db)):
+    return _batch_detail(conn, _fetch_batch(conn, bid))
+
+
+@app.post("/measurement-batches/{bid}/baselines", status_code=201)
+def submit_baseline(bid: int, body: BaselineRequest,
+                    conn: sqlite3.Connection = Depends(get_db)):
+    """开工前逐栓提交基线飞行时间；每栓每批至多一条，重复即拒绝（不覆盖）。"""
+    batch = _fetch_batch(conn, bid)
+    proc = _fetch_proc(conn, batch["procedure_id"])
+    _require_batch_open(batch)
+    if proc["status"] not in BASELINE_STATUSES:
+        raise HTTPException(409, detail={
+            "reason": "baseline_window_closed",
+            "message": f"工艺状态 {proc['status']}：基线仅在 approved/in_progress 阶段提交；"
+                       "缺失基线的螺栓只能在复核结论中记为证据缺口",
+        })
+    if body.bolt_no not in batch["scope_bolts"]:
+        raise HTTPException(409, detail={
+            "reason": "bolt_out_of_scope",
+            "message": f"螺栓 {body.bolt_no} 不在批次测量范围 {sorted(batch['scope_bolts'])}"
+                       + ("（补拧锁定螺栓沿用原合格结果）" if batch["locked_bolts"] else ""),
+        })
+    exists = conn.execute(
+        "SELECT id FROM measurement_baselines WHERE batch_id=? AND bolt_no=?",
+        (bid, body.bolt_no)).fetchone()
+    if exists:
+        raise HTTPException(409, detail={
+            "reason": "baseline_exists",
+            "message": f"螺栓 {body.bolt_no} 基线已冻结（记录 {exists['id']}），"
+                       "禁止覆盖；参数变更须新建批次",
+        })
+    cur = conn.execute(
+        "INSERT INTO measurement_baselines (batch_id, bolt_no, tof_s, created_at)"
+        " VALUES (?,?,?,?)",
+        (bid, body.bolt_no, body.tof_s, utcnow()))
+    conn.commit()
+    return {
+        "baseline_id": cur.lastrowid, "batch_id": bid, "bolt_no": body.bolt_no,
+        "tof_s": body.tof_s,
+        "baselines_received": conn.execute(
+            "SELECT COUNT(*) c FROM measurement_baselines WHERE batch_id=?",
+            (bid,)).fetchone()["c"],
+        "baselines_required": len(batch["scope_bolts"]),
+    }
+
+
+def _submit_reading(conn: sqlite3.Connection, batch: dict, *, bolt_no: int, tof_s: float,
+                    temperature_c: float, operator: str, measured_at: datetime,
+                    supersedes: int | None, amendment_note: str | None,
+                    payload: dict) -> dict:
+    _require_batch_open(batch)
+    if bolt_no not in batch["scope_bolts"]:
+        raise HTTPException(409, detail={
+            "reason": "bolt_out_of_scope",
+            "message": f"螺栓 {bolt_no} 不在批次测量范围 {sorted(batch['scope_bolts'])}"
+                       + ("（补拧锁定螺栓沿用原合格结果）" if batch["locked_bolts"] else ""),
+        })
+    cur = conn.execute(
+        """INSERT INTO measurement_readings
+           (batch_id, bolt_no, tof_s, temperature_c, operator, measured_at,
+            supersedes, excluded, amendment_note, created_at)
+           VALUES (?,?,?,?,?,?,?,0,?,?)""",
+        (batch["id"], bolt_no, tof_s, temperature_c, operator,
+         measured_at.isoformat(), supersedes, amendment_note, utcnow()),
+    )
+    reading = dict(conn.execute(
+        "SELECT * FROM measurement_readings WHERE id=?", (cur.lastrowid,)).fetchone())
+    baselines, readings = _batch_evals(conn, batch)
+    frozen = {**batch, "bolt_count": _fetch_proc(conn, batch["procedure_id"])["bolt_count"]}
+    result = evaluate_reading(frozen,
+                              next((b for b in baselines if b["bolt_no"] == bolt_no), None),
+                              reading)
+    if result["gaps"]:
+        _record_gap(conn, batch, bolt_no, result["gaps"], payload)
+    conn.commit()
+    return {"reading_id": cur.lastrowid, "batch_id": batch["id"], "revision": batch["revision"],
+            "bolt_result": result,
+            "valid": not result["gaps"],
+            "evidence_gap": [GAP_MESSAGES[g] for g in result["gaps"]] or None}
+
+
+@app.post("/measurement-batches/{bid}/readings", status_code=201)
+def submit_reading(bid: int, body: RemeasurementRequest,
+                   conn: sqlite3.Connection = Depends(get_db)):
+    """completed/reviewed 后逐栓提交复测读数；证据缺口照记（201），绝不判合格。"""
+    batch = _fetch_batch(conn, bid)
+    proc = _fetch_proc(conn, batch["procedure_id"])
+    if proc["status"] not in REMEASURE_STATUSES:
+        raise HTTPException(409, detail={
+            "reason": "not_ready_for_remeasurement",
+            "message": f"工艺状态 {proc['status']}：复测须在 completed/reviewed 后提交",
+        })
+    existing = conn.execute(
+        "SELECT id FROM measurement_readings WHERE batch_id=? AND bolt_no=? ORDER BY id DESC",
+        (bid, body.bolt_no)).fetchone()
+    if existing is not None:
+        raise HTTPException(409, detail={
+            "reason": "reading_exists_use_retest",
+            "message": f"螺栓 {body.bolt_no} 已有读数 {existing['id']}；重新测量须走重测接口"
+                       "并注明理由（原值保留，批次修订号 +1）",
+            "reading_id": existing["id"],
+        })
+    return _submit_reading(
+        conn, batch, bolt_no=body.bolt_no, tof_s=body.tof_s,
+        temperature_c=body.temperature_c, operator=body.operator,
+        measured_at=body.measured_at, supersedes=None, amendment_note=None,
+        payload=body.model_dump(mode="json"))
+
+
+@app.post("/measurement-batches/{bid}/retests", status_code=201)
+def retest_reading(bid: int, body: RetestRequest,
+                   conn: sqlite3.Connection = Depends(get_db)):
+    """重测：原读数保留（supersedes 指向），须注明理由，批次修订号 +1。"""
+    batch = _fetch_batch(conn, bid)
+    _require_batch_open(batch)
+    if body.bolt_no not in batch["scope_bolts"]:
+        raise HTTPException(409, detail={
+            "reason": "bolt_out_of_scope",
+            "message": f"螺栓 {body.bolt_no} 不在批次测量范围 {sorted(batch['scope_bolts'])}",
+        })
+    prev = conn.execute(
+        "SELECT * FROM measurement_readings WHERE batch_id=? AND bolt_no=? ORDER BY id DESC",
+        (bid, body.bolt_no)).fetchone()
+    if prev is None:
+        raise HTTPException(409, detail={
+            "reason": "no_reading_to_retest",
+            "message": f"螺栓 {body.bolt_no} 尚无复测读数，不能重测（请先提交复测）",
+        })
+    conn.execute("UPDATE measurement_batches SET revision=revision+1 WHERE id=?", (bid,))
+    conn.commit()
+    batch = _fetch_batch(conn, bid)
+    return _submit_reading(
+        conn, batch, bolt_no=body.bolt_no, tof_s=body.tof_s,
+        temperature_c=body.temperature_c, operator=body.operator,
+        measured_at=body.measured_at, supersedes=prev["id"],
+        amendment_note=f"重测：{body.reason}", payload=body.model_dump(mode="json"))
+
+
+@app.post("/measurement-batches/{bid}/exclusions", status_code=201)
+def exclude_reading(bid: int, body: ExcludeRequest,
+                    conn: sqlite3.Connection = Depends(get_db)):
+    """排除读数：注明理由，原值保留不删除，修订号 +1，须重测补证后才能确认。"""
+    batch = _fetch_batch(conn, bid)
+    _require_batch_open(batch)
+    if body.bolt_no not in batch["scope_bolts"]:
+        raise HTTPException(409, detail={
+            "reason": "bolt_out_of_scope",
+            "message": f"螺栓 {body.bolt_no} 不在批次测量范围 {sorted(batch['scope_bolts'])}",
+        })
+    latest = conn.execute(
+        "SELECT * FROM measurement_readings WHERE batch_id=? AND bolt_no=? ORDER BY id DESC",
+        (bid, body.bolt_no)).fetchone()
+    if latest is None:
+        raise HTTPException(409, detail={
+            "reason": "no_reading_to_exclude",
+            "message": f"螺栓 {body.bolt_no} 无读数可排除",
+        })
+    if latest["excluded"]:
+        raise HTTPException(409, detail={
+            "reason": "reading_already_excluded",
+            "message": f"螺栓 {body.bolt_no} 最新读数 {latest['id']} 已排除；请直接重测",
+        })
+    conn.execute(
+        "UPDATE measurement_readings SET excluded=1, amendment_note=? WHERE id=?",
+        (f"排除：{body.reason}", latest["id"]))
+    conn.execute("UPDATE measurement_batches SET revision=revision+1 WHERE id=?", (bid,))
+    _record_gap(conn, batch, body.bolt_no, ["reading_excluded"],
+                {"reading_id": latest["id"], "reason": body.reason})
+    conn.commit()
+    return {"reading_id": latest["id"], "batch_id": bid,
+            "revision": _fetch_batch(conn, bid)["revision"], "bolt_no": body.bolt_no,
+            "excluded": True, "reason": body.reason,
+            "message": "读数已排除并保留原值；该栓须重测取得有效结果"}
+
+
+@app.post("/measurement-batches/{bid}/confirm")
+def confirm_batch(bid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """确认批次：全部螺栓有效、落入预紧力目标带、对径不平衡达标。
+
+    不满足则只记录证据缺口，批次保持 open，返回 blockers 与逐栓明细。
+    """
+    batch = _fetch_batch(conn, bid)
+    _require_batch_open(batch)
+    detail = _batch_detail(conn, batch)
+    verdict = detail["verdict"]
+
+    # 证据缺口留痕（确认动作本身产生一版完整缺口快照，去重同一修订+理由）
+    for gap in verdict["evidence_gaps"]:
+        for reason in gap["reasons"]:
+            exists = conn.execute(
+                "SELECT 1 FROM measurement_gaps WHERE batch_id=? AND revision=? AND bolt_no=?"
+                " AND reason=?", (bid, batch["revision"], gap["bolt_no"], reason)).fetchone()
+            if not exists:
+                _record_gap(conn, batch, gap["bolt_no"], [reason],
+                            {"stage": "confirm_attempt"})
+
+    if not verdict["confirmed"]:
+        conn.commit()
+        raise HTTPException(409, detail={
+            "reason": "batch_not_confirmed",
+            "message": "存在证据缺口或限值超标，不能确认批次；可对失败批次派生补拧草稿",
+            "blockers": verdict["blockers"],
+            "verdict": verdict,
+        })
+
+    conn.execute(
+        "UPDATE measurement_batches SET status='confirmed', confirmed_revision=revision,"
+        " confirmed_at=? WHERE id=?", (utcnow(), bid))
+    conn.commit()
+    return {"batch_id": bid, "status": "confirmed",
+            "confirmed_revision": batch["revision"], "verdict": verdict}
+
+
+@app.post("/measurement-batches/{bid}/derive-rework", status_code=201)
+def derive_rework(bid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """失败批次派生补拧草稿：锁定合格螺栓，其余栓按现有交叉规则安排末轮补拧。"""
+    batch = _fetch_batch(conn, bid)
+    if batch["status"] != "open":
+        raise HTTPException(409, detail={
+            "reason": f"batch_{batch['status']}",
+            "message": "仅开放（未确认）批次可派生补拧",
+        })
+    detail = _batch_detail(conn, batch)
+    bolts = detail["verdict"]["bolts"]
+    # 已继承的锁定合格结果始终保留；补拧范围内仅锁定本次仍然合格的螺栓
+    good = sorted({b["bolt_no"] for b in bolts
+                   if not b["gaps"] and b["in_target_band"]}
+                  | set(batch["locked_bolts"]))
+    targets = [x for x in batch["scope_bolts"] if x not in good]
+    if not targets:
+        raise HTTPException(409, detail={
+            "reason": "nothing_to_rework",
+            "message": "所有螺栓均合格，无需补拧；可直接确认批次",
+        })
+
+    proc = _fetch_proc(conn, batch["procedure_id"])
+    locked_set = set(good)
+    violations = sequence_violations(proc["bolt_count"], locked_set)
+    if violations:
+        pairs = "、".join(f"{a}→{b}" for a, b in violations)
+        raise HTTPException(409, detail={
+            "reason": "rework_sequence_not_realizable",
+            "message": "锁定合格螺栓后剩余螺栓按交叉规则会出现相邻连续步骤"
+                       f"（{pairs}），无法生成补拧序列",
+            "adjacent_pairs": [list(p) for p in violations],
+        })
+
+    data = _proc_as_create(proc, stage_ratios=[1.0])
+    new_pid = _insert_proc(
+        conn, data, version=proc["version"] + 1, parent_id=proc["id"],
+        change_note=f"超声批次 {bid} 复核失败派生补拧；锁定 {len(good)} 栓，"
+                    f"补拧 {len(targets)} 栓（末轮）")
+    locked_snapshot = {
+        str(b["bolt_no"]): b for b in bolts if b["bolt_no"] in good
+    }
+    conn.execute(
+        "INSERT INTO rework_jobs"
+        " (source_batch_id, source_procedure_id, rework_procedure_id,"
+        "  locked_bolts, target_bolts, created_at) VALUES (?,?,?,?,?,?)",
+        (bid, proc["id"], new_pid, json.dumps(good), json.dumps(targets), utcnow()))
+    conn.execute("UPDATE measurement_batches SET status='superseded' WHERE id=?", (bid,))
+    conn.commit()
+
+    new_proc = _fetch_proc(conn, new_pid)
+    return {
+        "rework_procedure": new_proc,
+        "derived_from_procedure": proc["id"],
+        "source_batch_id": bid,
+        "locked_bolts": good,
+        "target_bolts": targets,
+        "locked_results": locked_snapshot,
+        "plan": _proc_plan(conn, new_proc),
+        "message": "补拧草稿已生成（末轮 100%）；批准、开工、回传后按同一冻结参数"
+                   "建立新测量批次（仅补拧范围需基线/复测，锁定栓结果自动继承）",
+    }
