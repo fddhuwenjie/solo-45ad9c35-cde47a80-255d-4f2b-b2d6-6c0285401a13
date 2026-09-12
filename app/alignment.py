@@ -12,13 +12,15 @@
 2. 径向偏移（活动法兰中心相对固定法兰中心的位移向量 t）
        radial(θ) = t_x·sinθ + t_y·cosθ
    径向错边 = |t|，径向跳动 TIR = 2|t|。
-3. 垫片外缘位置 e_o（自法兰外缘向内量到垫片外缘）。垫片中心位移 g 时，
-   u 侧垫片外缘随垫片远离该侧法兰外缘，向内量距增大：
-       e_o(θ) = (R − r_o) + g_x·sinθ + g_y·cosθ
-   垫片偏心 = |g|；垫片居中余量：
+3. 垫片外缘位置 e_o（自法兰外缘向内量到垫片外缘）。垫片中心位移 g、实际
+   垫片相对冻结名义尺寸存在同心偏差 k 时：
+       e_o(θ) = (R − r_o) + k + g_x·sinθ + g_y·cosθ
+   拟合把常数 k（同心尺寸偏差，不等于偏心）与平移向量 g 分离；
+   垫片偏心 = |g|，最坏方位可能落在相邻测点之间，故垫片居中余量
+   一律按拟合偏心量计算全圆周最坏值：
      流道侧（内缘不得侵入内孔）: (Gi − Db)/2 − |g|
      法兰面侧（外缘不得越出法兰面）: (D − Go)/2 − |g|
-   侵入流道判据：|g| > (Gi − Db)/2。
+   侵入流道判据：(Gi − Db)/2 − |g| < 0。
 
 测点方位重复、覆盖弧段不足、单位不一致或几何自相矛盾时**只列证据缺口**，
 不产出伪造的拟合结论；超限、垫片侵入流道或需要螺栓强行拉拢时列为阻断项。
@@ -253,22 +255,22 @@ def analyze_alignment(frozen: dict, points: list[dict]) -> dict:
         tx, ty = rad_fit["beta"]
         mismatch = math.hypot(tx, ty)
 
-        # 3) 垫片外缘：垫片中心相对法兰中心位移 g 时，
-        #    e_o(θ) = (R − r_o) + g·u（u 侧垫片外缘更靠内，自外缘向内的量距增大）。
-        #    同心基准 (R−r_o) 先扣除；平面拟合给出垫片偏心向量与方位，
-        #    两侧居中余量直接取测点极值（最坏方位的直接证据，刚性平移下与拟合相等）。
+        # 3) 垫片外缘：垫片中心相对法兰中心位移 g、实际垫片相对冻结名义尺寸
+        #    存在同心偏差 k 时，自外缘向内的量距
+        #        e_o(θ) = (R − r_o) + k + g·u
+        #    （u 侧垫片外缘更靠内，量距增大；k>0 表示实际垫片整体偏小）。
+        #    常数项与平移向量分开拟合：k 是同心尺寸偏差（不构成偏心），
+        #    g 是平移；全圆周最坏方位可能落在相邻测点之间，故两侧居中余量
+        #    一律按拟合偏心量 |g| 计算，而非离散测点极值。
         edge_rows = [
             {**p, "_edge_centered": p["gasket_edge_position_mm"] - (R - ro)}
             for p in converted
         ]
-        gas_fit = _fit_plane(edge_rows, "_edge_centered", with_mean=False)
-        gx, gy = gas_fit["beta"]
+        gas_fit = _fit_plane(edge_rows, "_edge_centered", with_mean=True)
+        gx, gy, uniform_k = gas_fit["beta"]
         eccentricity = math.hypot(gx, gy)
-        edge_min = min(p["gasket_edge_position_mm"] for p in converted)
-        edge_max = max(p["gasket_edge_position_mm"] for p in converted)
-        e0 = R - ro
-        inner_margin = ri - Db / 2.0 - (edge_max - e0)
-        outer_margin = edge_min
+        inner_margin = (Gi - Db) / 2.0 - eccentricity
+        outer_margin = (D - Go) / 2.0 - eccentricity
 
         metrics = {
             "gap_max_mm": round(gap_max, 6),
@@ -285,6 +287,7 @@ def analyze_alignment(frozen: dict, points: list[dict]) -> dict:
             "radial_fit_residual_rms_mm": rad_fit["rms"],
             "gasket_eccentricity_mm": round(eccentricity, 6),
             "gasket_azimuth_deg": round(_azimuth(gx, gy), 3) if eccentricity > 1e-12 else None,
+            "gasket_sizing_offset_mm": round(uniform_k, 6),
             "gasket_inner_margin_mm": round(inner_margin, 6),
             "gasket_outer_margin_mm": round(outer_margin, 6),
             "gasket_fit_residual_rms_mm": gas_fit["rms"],

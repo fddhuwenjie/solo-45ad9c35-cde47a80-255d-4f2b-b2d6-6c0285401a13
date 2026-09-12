@@ -128,11 +128,11 @@ def test_radial_and_gasket_vector_fit():
     assert m["gasket_eccentricity_mm"] == pytest.approx(math.hypot(0.5, 0.2), abs=1e-6)
     assert m["gasket_azimuth_deg"] == pytest.approx(
         math.degrees(math.atan2(0.5, 0.2)) % 360, abs=1e-3)
-    # 测点未采到连续最坏方位：内/外余量按测点极值（直接证据）而非拟合向量
-    measured_shift = max(0.5 * math.sin(math.radians(a)) + 0.2 * math.cos(math.radians(a))
-                         for a in ANGLES8)
-    assert m["gasket_inner_margin_mm"] == pytest.approx(10.0 - measured_shift, abs=1e-6)
-    assert m["gasket_outer_margin_mm"] == pytest.approx(EDGE0 - measured_shift, abs=1e-6)
+    # 全圆周最坏方位按拟合偏心量计算（不取离散测点极值）
+    shift_max = math.hypot(0.5, 0.2)
+    assert m["gasket_inner_margin_mm"] == pytest.approx(10.0 - shift_max, abs=1e-6)
+    assert m["gasket_outer_margin_mm"] == pytest.approx(EDGE0 - shift_max, abs=1e-6)
+    assert m["gasket_sizing_offset_mm"] == pytest.approx(0.0, abs=1e-9)
 
 
 def test_four_points_quarter_circle_is_minimum():
@@ -197,39 +197,61 @@ def test_gasket_outside_face_gap():
 
 
 def test_undersized_concentric_gasket_is_not_contradiction():
-    """垫片整体偏小（同心、各方位量距一致偏大但不侵入）：非矛盾也非阻断，
+    """垫片整体偏小（同心、各方位量距一致偏大但不侵入）：非矛盾也非阻断。
 
-    垫片外缘留得更宽、内缘也离开内孔；常数残差记录在拟合 RMS 中。
+    常数项 k 吸收同心尺寸偏差：偏心为 0，两侧余量按名义同心间隙计，
+    整体偏小只体现在 gasket_sizing_offset_mm 与残差（此处拟合完全吸收，RMS=0）。
     """
     pts = points8(edge=16.0)
     r = analysis(pts)
     assert r["passed"] is True and r["evidence_gaps"] == []
     m = r["metrics"]
     assert m["gasket_eccentricity_mm"] == pytest.approx(0.0, abs=1e-9)
-    assert m["gasket_inner_margin_mm"] == pytest.approx(10 - 8.5)
-    assert m["gasket_outer_margin_mm"] == pytest.approx(16.0)
-    assert m["gasket_fit_residual_rms_mm"] == pytest.approx(8.5)
+    assert m["gasket_sizing_offset_mm"] == pytest.approx(8.5)
+    assert m["gasket_inner_margin_mm"] == pytest.approx(10.0)
+    assert m["gasket_outer_margin_mm"] == pytest.approx(7.5)
+    assert m["gasket_fit_residual_rms_mm"] == pytest.approx(0.0, abs=1e-9)
 
 
-def test_intrusion_judged_from_measured_extrema():
-    """内余量按测点边缘极值（最坏方位直接证据）判定：6mm 平移时内余量 4mm 为正。
+def test_intrusion_worst_azimuth_between_sample_points():
+    """回归：最坏方位落在相邻测点之间时，按离散测点会漏判，按拟合偏心量须阻断。
 
-    平移再大（11mm）时内余量 -1mm，即使平行度/径向都合格也必须阻断。
+    窄同心内余量 (Gi-Db)/2 = 3.0mm。8 方位测点，平移轴 22.5°（落在 0°/45°
+    两测点正中），偏心 3.1mm：测点采到的最大平移分量为 3.1·cos22.5°=2.864027，
+    离散算法给出 3.0−2.864027 = +0.135973mm（误放行），
+    全圆周最坏余量 3.0−3.1 = −0.1mm（垫片侵入流道，须阻断）。
     """
-    pts = [pt(a, edge=EDGE0 + 6.0 * math.sin(math.radians(a))) for a in ANGLES8]
-    r = analysis(pts)
-    assert r["metrics"]["gasket_inner_margin_mm"] == pytest.approx(4.0)
-    assert not any(b["reason"] == BL_GASKET_INTRUSION for b in r["blockers"])
+    phi = math.radians(22.5)
+    gx, gy = 3.1 * math.sin(phi), 3.1 * math.cos(phi)
 
-    # 窄同心内余量（3mm，见 test_gasket_intrusion_blocks 的冻结参数）：
-    # 2.5mm 平移的测点极值即把内余量压到 0.5mm；8mm 时侵入流道。
+    def edge(a):
+        return 20.0 + gx * math.sin(math.radians(a)) + gy * math.cos(math.radians(a))
+
+    pts = [pt(a, edge=edge(a)) for a in ANGLES8]
+    discrete_component = 3.1 * math.cos(math.radians(22.5))
+    assert discrete_component == pytest.approx(2.864027, abs=1e-6)
+    assert 3.0 - discrete_component == pytest.approx(0.135973, abs=1e-6)
+
     narrow = {**FROZEN, "flange_face_diameter_mm": 300.0,
               "gasket_inner_diameter_mm": 206.0, "gasket_outer_diameter_mm": 260.0}
-    pts = [pt(a, edge=20.0 + 8.0 * math.sin(math.radians(a))) for a in ANGLES8]
     r = analysis(pts, narrow)
-    assert r["metrics"]["gasket_inner_margin_mm"] == pytest.approx(-5.0)
-    assert any(b["reason"] == BL_GASKET_INTRUSION for b in r["blockers"])
-    # 极端平移让对侧测点量距为负：属于几何矛盾缺口（只列证据，不产出指标）
+    assert r["evaluable"] and r["evidence_gaps"] == []
+    m = r["metrics"]
+    assert m["gasket_eccentricity_mm"] == pytest.approx(3.1, abs=1e-6)
+    assert m["gasket_azimuth_deg"] == pytest.approx(22.5, abs=1e-3)
+    assert m["gasket_inner_margin_mm"] == pytest.approx(-0.1, abs=1e-6)
+    assert m["gasket_outer_margin_mm"] == pytest.approx(20.0 - 3.1, abs=1e-6)
+    b = next((x for x in r["blockers"] if x["reason"] == BL_GASKET_INTRUSION), None)
+    assert b is not None
+    assert b["detail"]["gasket_inner_margin_mm"] == pytest.approx(-0.1, abs=1e-6)
+    assert r["passed"] is False
+    # 各测点边缘读数自身合法（量距最大 22.864 < R+ri=253），不产生几何矛盾缺口
+    assert not [g for g in r["evidence_gaps"]
+                if g["reason"] == GAP_GASKET_OUTSIDE_FACE]
+
+
+def test_extreme_translation_makes_measured_edge_negative():
+    """平移大到对侧测点边缘量距为负：属于几何矛盾缺口（只列证据，不产出指标）。"""
     pts = [pt(a, edge=EDGE0 + 11.0 * math.sin(math.radians(a))) for a in ANGLES8]
     r = analysis(pts)
     assert r["metrics"] is None and r["evaluable"] is False
@@ -470,6 +492,56 @@ def test_angle_normalized_on_storage(client):
         f"/alignment-checks/{r.json()['alignment_check']['check_id']}").json()
     stored = sorted(p["angle_deg"] for p in detail["points"])
     assert stored == [45.0, 90.0, 135.0, 225.0, 315.0]
+
+
+def test_between_points_intrusion_blocks_approve_and_start_api(client):
+    """API 回归（用户报告场景）：8 方位测点、平移轴 22.5°，最坏方位落在
+    相邻测点之间。离散算法余量 +0.135973 会误放行；按拟合偏心量得到
+    全圆周最坏余量 -0.1mm，批准与开工门禁都必须拦住。"""
+    pid = make_draft(client)
+    narrow = {**FROZEN, "flange_face_diameter_mm": 300.0,
+              "gasket_inner_diameter_mm": 206.0, "gasket_outer_diameter_mm": 260.0}
+    phi = math.radians(22.5)
+    gx, gy = 3.1 * math.sin(phi), 3.1 * math.cos(phi)
+
+    def edge_points(ecc):
+        ex, ey = ecc * math.sin(phi), ecc * math.cos(phi)
+        return [{"angle_deg": a, "axial_gap": 2.0, "radial_offset": 0.0,
+                 "gasket_edge_position": 20.0
+                     + ex * math.sin(math.radians(a)) + ey * math.cos(math.radians(a)),
+                 "bolt_free_insertion": True} for a in ANGLES8]
+
+    # v1：偏心 3.1，旧离散算法会给 +0.135973；批准门禁拦截
+    submit(client, pid, edge_points(3.1), frozen=narrow)
+    r = client.post(f"/procedures/{pid}/approve")
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["reason"] == "alignment_check_not_passed"
+    assert BL_GASKET_INTRUSION in [b["reason"] for b in detail["blockers"]]
+    assert client.get(f"/procedures/{pid}").json()["procedure"]["status"] == "draft"
+
+    # v2 找正到偏心 2.0（全圆周内余量 +1.0）后可批准
+    submit(client, pid, edge_points(2.0), frozen=narrow, reason="重新对中垫片后复测")
+    assert client.post(f"/procedures/{pid}/approve").status_code == 200
+
+    # v3 批准后、开工前垫片再次偏移到 3.1mm：开工门禁拦截
+    submit(client, pid, edge_points(3.1), frozen=narrow, reason="设备移位后复测")
+    r = client.post(f"/procedures/{pid}/start")
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["reason"] == "alignment_check_not_passed"
+    assert BL_GASKET_INTRUSION in [b["reason"] for b in detail["blockers"]]
+
+    # 作业包采用最新（失败）版本：离散余量 +0.135973 但拟合最坏余量 -0.1
+    pkg = client.get(f"/procedures/{pid}/package").json()
+    assert pkg["alignment"]["version"] == 3
+    assert pkg["alignment"]["analysis"]["passed"] is False
+    assert pkg["alignment"]["analysis"]["metrics"][
+        "gasket_inner_margin_mm"] == pytest.approx(-0.1, abs=1e-6)
+
+    # v4 再次找正后方可开工
+    submit(client, pid, edge_points(2.0), frozen=narrow, reason="重新找正后复测")
+    assert client.post(f"/procedures/{pid}/start").status_code == 200
 
 
 def test_bad_frozen_geometry_rejected(client):
