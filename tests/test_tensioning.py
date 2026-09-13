@@ -7,10 +7,10 @@ from fastapi.testclient import TestClient
 
 from app.db import init_db
 from app.main import app
-from app.tensioning import (build_scheme, flatten_groups, load_for_pressure_kn,
-                            predicted_residual_kn, predicted_stroke_mm,
-                            pressure_for_load_mpa, required_applied_load_kn,
-                            residual_band_kn)
+from app.tensioning import (build_scheme, distribute_transfer_loss, flatten_groups,
+                            load_for_pressure_kn, predicted_residual_kn,
+                            predicted_stroke_mm, pressure_for_load_mpa,
+                            required_applied_load_kn, residual_band_kn)
 
 BASE = {
     "flange_class": "PN40 DN200",
@@ -173,6 +173,37 @@ def test_load_pressure_roundtrip():
     assert predicted_stroke_mm(applied, 150.0, 206000.0, 353.0) \
         == pytest.approx(0.339741, rel=1e-4)
     assert residual_band_kn(140.0, 1.0, 10.0) == (126.0, 154.0)
+
+
+def test_distribute_transfer_loss_opposite_orders():
+    """相反卸压次序：逐栓残余互换（先卸者低、后卸者高），整组均值不变。"""
+    applied = {1: 82.352941, 5: 82.352941}
+    fwd = distribute_transfer_loss(applied, [1, 5], 0.15)
+    rev = distribute_transfer_loss(applied, [5, 1], 0.15)
+    # m=2：位次权重 2/3、1/3，组损失 Λ=0.15×2F -> 0.8F 与 0.9F
+    assert fwd[1] == pytest.approx(0.8 * 82.352941, rel=1e-6)
+    assert fwd[5] == pytest.approx(0.9 * 82.352941, rel=1e-6)
+    assert rev[1] == fwd[5]
+    assert rev[5] == fwd[1]
+    # 均值与不分顺序的均匀估计一致（向后兼容），且不同于旧逐栓均匀值
+    mean = sum(fwd.values()) / 2
+    assert mean == pytest.approx(predicted_residual_kn(82.352941, 0.15))
+    assert fwd[1] != pytest.approx(predicted_residual_kn(82.352941, 0.15))
+
+
+def test_distribute_transfer_loss_weights_and_singleton():
+    """权重和为 1（组损失守恒）；单栓组退化为 F·(1−λ)。"""
+    applied = {b: 100.0 for b in (2, 6, 4, 8)}
+    res = distribute_transfer_loss(applied, [8, 4, 6, 2], 0.05)
+    losses = {b: 100.0 - res[b] for b in applied}
+    assert sum(losses.values()) == pytest.approx(0.05 * 400.0)  # 组损失守恒
+    # 线性递减权重 0.4/0.3/0.2/0.1：先卸者承担更多
+    assert losses[8] == pytest.approx(0.4 * 20.0)
+    assert losses[4] == pytest.approx(0.3 * 20.0)
+    assert losses[6] == pytest.approx(0.2 * 20.0)
+    assert losses[2] == pytest.approx(0.1 * 20.0)
+    single = distribute_transfer_loss({3: 82.352941}, [3], 0.15)
+    assert single[3] == pytest.approx(predicted_residual_kn(82.352941, 0.15))
 
 
 def test_scheme_full_coverage_spacing_and_rotation():
@@ -406,7 +437,60 @@ def test_report_residual_out_of_tolerance(client):
     assert detail["reason"] == "residual_out_of_tolerance"
     assert detail["bolt_no"] == 5
     assert detail["allowed_interval"] == [126.0, 154.0]
-    assert detail["residual_load_kn"] == pytest.approx(102.0)
+    # 卸压次序 [2,5]：栓 5 位次 2/2，承担 1/3 组损失 -> 120 − 12 = 108kN
+    assert detail["residual_load_kn"] == pytest.approx(108.0)
+    assert detail["release_position"] == 2
+
+
+def test_release_order_swaps_flagged_bolt(client):
+    """回归：压力/行程相同，相反卸压次序定位到不同的栓（次序参与载荷转移）。"""
+    # 39MPa -> 施加 78kN；m=2、λ=0.15 时首卸栓 0.8×78=62.4kN < 63kN 超差，
+    # 末卸栓 0.9×78=70.2kN 合格 —— 哪栓超差由卸压次序决定
+    pid, tid = make_approved_plan(client)
+    r = client.post(f"/tensioning-plans/{tid}/round-reports",
+                    json=group_payload(1, 1, [1, 5], 39.0, release_order=[1, 5]))
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["reason"] == "residual_out_of_tolerance"
+    assert detail["bolt_no"] == 1                      # 栓 1 先卸，承担 2/3 组损失
+    assert detail["release_position"] == 1
+    assert detail["residual_load_kn"] == pytest.approx(62.4)
+    # 相反次序：同一组、同样压力，超差的变成栓 5
+    r = client.post(f"/tensioning-plans/{tid}/round-reports",
+                    json=group_payload(1, 1, [1, 5], 39.0, release_order=[5, 1]))
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["bolt_no"] == 5
+    assert detail["residual_load_kn"] == pytest.approx(62.4)
+    # 两次拒绝均留痕 anomalies（泵压正常但次序致失衡的证据）
+    anomalies = client.get(f"/procedures/{pid}/package").json()["anomalies"]
+    assert [a["bolt_no"] for a in anomalies[-2:]] == [1, 5]
+    assert all(a["reason"] == "residual_out_of_tolerance" for a in anomalies[-2:])
+
+
+def test_release_order_stored_consistently(client):
+    """回传响应、方案详情与 JSON 作业包的逐栓残余一致（同一换算结果）。"""
+    pid, tid = make_approved_plan(client)
+    r = client.post(f"/tensioning-plans/{tid}/round-reports",
+                    json=group_payload(1, 1, [1, 5], P1, release_order=[1, 5]))
+    assert r.status_code == 201
+    resp = {c["bolt_no"]: c["residual_load_kn"] for c in r.json()["channels"]}
+    # 设定压力 P1：施加 82.353kN，栓 1 先卸 65.882kN、栓 5 后卸 74.118kN
+    assert resp[1] == pytest.approx(65.882353, abs=1e-3)
+    assert resp[5] == pytest.approx(74.117647, abs=1e-3)
+    detail = client.get(f"/tensioning-plans/{tid}").json()
+    stored = {c["bolt_no"]: c["residual_load_kn"]
+              for c in detail["reports"][0]["channels"]}
+    assert stored == resp
+    package = client.get(f"/procedures/{pid}/package").json()
+    packed = {c["bolt_no"]: c["residual_load_kn"]
+              for c in package["tensioning"]["reports"][0]["channels"]}
+    assert packed == resp
+    # 评估视图读取同一批落库值
+    groups = {g["group_no"]: g for g in package["tensioning"]["evaluation"]["groups"]
+              if g["round_no"] == 1}
+    assert {c["bolt_no"]: c["residual_load_kn"]
+            for c in groups[1]["channels"]} == resp
 
 
 # ---------------------------------------------------------------- 修订：人工改组与中断重排
@@ -427,15 +511,18 @@ def test_revision_regroups_only_unfinished_groups(client):
     r = client.post(f"/tensioning-plans/{tid}/round-reports",
                     json=group_payload(1, 1, [1, 5], P1))
     assert r.status_code == 201
+    # 改四机同步；λ=0.15 下 4 栓组均匀加压必然超差（首卸栓仅 0.76F），
+    # 同修订换用低摩擦垫圈把转移系数降到 0.05
     r = client.post(f"/tensioning-plans/{tid}/revisions",
-                    json={"reason": "现场增援两台拉伸器，改四机同步",
-                          "tensioner_count": 4})
+                    json={"reason": "增援两台拉伸器改四机同步，换低摩擦垫圈降转移系数",
+                          "tensioner_count": 4,
+                          "load_transfer_coefficient": 0.05})
     assert r.status_code == 201, r.text
     new = r.json()["tensioning_plan"]
     assert new["plan"]["revision"] == 2
     assert new["plan"]["parent_id"] == tid
     assert new["plan"]["status"] == "approved"  # 继承批准状态（批准快照随修订）
-    assert new["plan"]["change_note"] == "现场增援两台拉伸器，改四机同步"
+    assert new["plan"]["change_note"] == "增援两台拉伸器改四机同步，换低摩擦垫圈降转移系数"
     # 已完成组原位锁定；第 1 轮剩余栓重排为 4 机组
     groups1 = [(g["group_no"], g["bolts"], g["locked"], g["status"])
                for g in new["scheme"][0]["groups"]]
@@ -448,12 +535,17 @@ def test_revision_regroups_only_unfinished_groups(client):
                     json=group_payload(1, 2, [2, 6], P1))
     assert r.status_code == 409
     assert r.json()["detail"]["reason"] == "plan_read_only"
-    # 新修订从第 1 轮第 2 组继续（重排后的 4 机组）
+    # 新修订从第 1 轮第 2 组继续（重排后的 4 机组，按新 λ 对应压力回传）
     new_tid = new["plan"]["id"]
+    p1_new = 70.0 / 0.95 / 2.0   # λ=0.05 时目标残余 70kN 的通道压力
     r = client.post(f"/tensioning-plans/{new_tid}/round-reports",
-                    json=group_payload(1, 2, [2, 6, 4, 8], P1))
+                    json=group_payload(1, 2, [2, 6, 4, 8], p1_new))
     assert r.status_code == 201, r.text
     assert r.json()["next_group"]["bolts"] == [3, 7]
+    # 4 栓组按卸压位次分配：残余 67.79/69.26/70.74/72.21kN 均在 [63,77] 内
+    res = {c["bolt_no"]: c["residual_load_kn"] for c in r.json()["channels"]}
+    assert res[8] == pytest.approx(67.7895, abs=1e-3)   # 位次 1/4，承担 40% 组损失
+    assert res[2] == pytest.approx(72.2105, abs=1e-3)   # 位次 4/4，承担 10% 组损失
 
 
 def test_revision_diff_and_chain(client):

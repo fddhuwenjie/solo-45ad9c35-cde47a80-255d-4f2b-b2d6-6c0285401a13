@@ -6,7 +6,15 @@
         F_pull = p · A_h            （p 泵压 MPa = N/mm²，A_h 液压有效面积 mm²）
 
     卸压后载荷转移（螺母贴合、螺纹嵌入、垫片回弹），按冻结的载荷转移系数 λ：
-        F_res = F_pull · (1 − λ)    （预测残余预紧力）
+        同组总转移损失 Λ = λ · ΣF_pull（整组守恒）
+
+    载荷转移按卸压先后逐步分配：同组栓依次卸压时，先卸压的栓在后续每次
+    卸压引起的法兰回弹中被再次卸载，承担更大份额。按卸压位次 j（1 起，
+    共 m 栓）取线性递减权重 w_j = 2·(m−j+1) / (m·(m+1))：
+        R_j = F_j − w_j · Λ
+    整组均值恒为 (1−λ)·F̄（与不分顺序的均匀估计一致），m=1 时退化为
+    F·(1−λ)；逐栓残余预紧力因此反映卸压次序——先卸者偏低、后卸者偏高，
+    泵压记录相同而次序不同，逐栓结论不同。
 
     因此每轮目标残余 ρ·F_target 所需的设定泵压：
         p_set = ρ · F_target / (1 − λ) / A_h
@@ -87,8 +95,33 @@ def load_for_pressure_kn(pressure_mpa: float, hydraulic_area_mm2: float) -> floa
 
 
 def predicted_residual_kn(applied_load_kn: float, transfer: float) -> float:
-    """预测残余预紧力：F_res = F_pull · (1 − λ)。"""
+    """均匀估计的预测残余预紧力：F_res = F_pull · (1 − λ)。
+
+    单栓组（m=1）的精确结果；多栓组的整组均值。逐栓值须用
+    distribute_transfer_loss 按卸压次序分配。
+    """
     return applied_load_kn * (1.0 - transfer)
+
+
+def distribute_transfer_loss(applied_by_bolt: dict[int, float],
+                             release_order: list[int],
+                             transfer: float) -> dict[int, float]:
+    """按卸压先后逐步分配载荷转移，返回逐栓预测残余预紧力（kN）。
+
+    同组总转移损失 Λ = λ·ΣF_applied 守恒但不均摊：先卸压的栓在后续每次
+    卸压引起的法兰回弹中被再次卸载，承担更大份额。卸压位次 j（1 起，
+    共 m 栓）的线性递减权重 w_j = 2·(m−j+1)/(m·(m+1))：
+        R_j = F_j − w_j · Λ
+    权重和为 1，整组均值恒为 (1−λ)·F̄；release_order 须恰好覆盖
+    applied_by_bolt 的栓号（回传校验先于本函数保证）。
+    """
+    m = len(release_order)
+    total_loss = transfer * sum(applied_by_bolt.values())
+    residuals: dict[int, float] = {}
+    for pos, bolt in enumerate(release_order, start=1):
+        weight = 2.0 * (m - pos + 1) / (m * (m + 1))
+        residuals[bolt] = applied_by_bolt[bolt] - weight * total_loss
+    return residuals
 
 
 def predicted_stroke_mm(load_kn: float, length_mm: float, modulus_mpa: float,
@@ -359,38 +392,53 @@ def validate_round_report(plan: dict, rounds: list[dict], done: list[dict],
                 extra={"spread_pct": round(spread_pct, 4),
                        "max_bolt_no": p_max_b, "min_bolt_no": p_min_b})
 
-    # 逐栓残余预紧力超差（原始区间 = 本轮目标带）
+    # 逐栓残余预紧力超差（原始区间 = 本轮目标带；按卸压次序分配载荷转移）
     lo, hi = residual_band_kn(plan["target_load_kn"], expected["ratio"],
                               plan["load_tolerance_pct"])
+    applied = {c.bolt_no: load_for_pressure_kn(c.pressure_mpa,
+                                               plan["hydraulic_area_mm2"])
+               for c in report.channels}
+    residuals = distribute_transfer_loss(
+        applied, report.release_order, plan["load_transfer_coefficient"])
+    m = len(report.release_order)
     for c in report.channels:
-        applied = load_for_pressure_kn(c.pressure_mpa, plan["hydraulic_area_mm2"])
-        residual = predicted_residual_kn(applied, plan["load_transfer_coefficient"])
+        residual = residuals[c.bolt_no]
         if not (lo <= residual <= hi):
+            pos = report.release_order.index(c.bolt_no) + 1
             return TensionRejection(
                 REJ_RESIDUAL_OUT_OF_TOLERANCE,
                 f"栓 {c.bolt_no} 预测残余预紧力 {round(residual, 4)}kN 超出第 "
                 f"{expected['round_no']} 轮目标带 [{round(lo, 4)}, {round(hi, 4)}]kN"
-                f"（通道压力 {c.pressure_mpa}MPa 换算施加 {round(applied, 4)}kN，"
-                f"载荷转移系数 {plan['load_transfer_coefficient']}）",
+                f"（通道压力 {c.pressure_mpa}MPa 换算施加 "
+                f"{round(applied[c.bolt_no], 4)}kN，卸压位次 {pos}/{m}，"
+                f"载荷转移系数 {plan['load_transfer_coefficient']} 按卸压次序分配）",
                 c.bolt_no,
                 allowed_interval=[round(lo, 4), round(hi, 4)],
                 extra={"residual_load_kn": round(residual, 6),
-                       "applied_load_kn": round(applied, 6)})
+                       "applied_load_kn": round(applied[c.bolt_no], 6),
+                       "release_position": pos,
+                       "group_size": m})
     return None
 
 
 def channel_results(plan: dict, report) -> list[dict]:
-    """回传通道换算结果：逐栓施加载荷与预测残余预紧力（落库与响应共用）。"""
+    """回传通道换算结果：逐栓施加载荷与预测残余预紧力（落库与响应共用）。
+
+    残余预紧力按卸压次序分配载荷转移（与回传超差判定同一换算）。
+    """
+    applied = {c.bolt_no: load_for_pressure_kn(c.pressure_mpa,
+                                               plan["hydraulic_area_mm2"])
+               for c in report.channels}
+    residuals = distribute_transfer_loss(
+        applied, report.release_order, plan["load_transfer_coefficient"])
     out: list[dict] = []
     for c in report.channels:
-        applied = load_for_pressure_kn(c.pressure_mpa, plan["hydraulic_area_mm2"])
         out.append({
             "bolt_no": c.bolt_no,
             "pressure_mpa": c.pressure_mpa,
             "stroke_mm": c.stroke_mm,
-            "applied_load_kn": round(applied, 6),
-            "residual_load_kn": round(predicted_residual_kn(
-                applied, plan["load_transfer_coefficient"]), 6),
+            "applied_load_kn": round(applied[c.bolt_no], 6),
+            "residual_load_kn": round(residuals[c.bolt_no], 6),
         })
     return out
 

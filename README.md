@@ -10,7 +10,7 @@ Python + FastAPI 接收请求，Pydantic 核验字段，工艺与执行版本写
 python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/uvicorn app.main:app --reload          # 默认库文件 ./flange.db
 FLANGE_DB=/path/to.db .venv/bin/uvicorn app.main:app
-.venv/bin/python -m pytest tests/ -q             # 139 个测试
+.venv/bin/python -m pytest tests/ -q             # 261 个测试
 ```
 
 ## 输入项（POST /procedures）
@@ -259,7 +259,12 @@ n=4 数学上无法生成全程非相邻序列（1-3-2-4 中 3→2 相邻），�
 `POST /tensioning-plans/{id}/approve` 冻结批准快照（修订内容不可变）后，
 `POST /tensioning-plans/{id}/round-reports` 按方案组序回传：各通道压力/活塞行程、
 保压时段与卸压次序（须恰好覆盖本组）。服务换算逐栓施加载荷
-`F = p·A_h` 与预测残余预紧力 `F_res = F·(1−λ)`。以下情形**拒绝推进、记录异常
+`F = p·A_h`，并**按卸压先后逐步分配载荷转移**得到逐栓预测残余预紧力：
+同组总转移损失 `Λ = λ·ΣF` 守恒但不均摊——先卸压的栓在后续每次卸压引起的
+法兰回弹中被再次卸载，承担更大份额；卸压位次 j（共 m 栓）取线性递减权重
+`w_j = 2(m−j+1)/(m(m+1))`，`R_j = F_j − w_j·Λ`。整组均值恒为 `(1−λ)·F̄`，
+单栓组退化为 `F·(1−λ)`；泵压记录相同而卸压次序不同，逐栓残余结论不同
+（先卸者偏低、后卸者偏高）。以下情形**拒绝推进、记录异常
 （anomalies）并定位栓号与原始区间**：
 
 | reason | 含义 |
@@ -272,7 +277,7 @@ n=4 数学上无法生成全程非相邻序列（1-3-2-4 中 3→2 相邻），�
 | `stroke_exceeded` | 活塞行程超最大行程（机具超行程） |
 | `pressure_over_capacity` | 通道压力超拉伸器能力 |
 | `pressure_out_of_sync` | 组内压力极差/均值超同步允差（泵压正常≠各栓受力一致） |
-| `residual_out_of_tolerance` | 预测残余预紧力超当轮目标带 |
+| `residual_out_of_tolerance` | 预测残余预紧力超当轮目标带（按卸压位次分配载荷转移，返回卸压位次） |
 
 被拒回传不推进进度，该组整改后重新回传。`POST /tensioning-plans/{id}/confirm`
 要求全部组回传完成且末轮逐栓残余预紧力落入目标带，否则 409 返回 `blockers`
@@ -308,18 +313,20 @@ n=4 数学上无法生成全程非相邻序列（1-3-2-4 中 3→2 相邻），�
 
 ```
 app/
-  schemas.py     Pydantic 输入核验（工艺 + 超声 + 对中预检 + 轨迹 + 现场约束）
+  schemas.py     Pydantic 输入核验（工艺 + 超声 + 对中预检 + 轨迹 + 现场约束 + 液压张拉）
   sequencing.py  交叉顺序与分轮计划（支持补拧锁定螺栓过滤）
   planning.py    受限栓位规划器：回溯搜索排序、等待/换工具动作、无解诊断（纯函数）
   alignment.py   间隙面/径向/垫片偏心最小二乘拟合、证据缺口、阻断项、版本差异（纯函数）
   rules.py       回传校验规则（纯函数）
   ultrasonic.py  时差->伸长->预紧力换算、证据缺口、离散度与对径不平衡（纯函数）
-  db.py          SQLite 模式与连接（预检版本/测点、批次/基线/读数/缺口/补拧作业/现场约束/计划修订）
+  tensioning.py  张拉换算、分轮换位方案、按卸压次序分配载荷转移、回传校验与评估（纯函数）
+  db.py          SQLite 模式与连接（预检/批次/轨迹/现场约束/计划修订/张拉方案与回传）
   svg.py         圆周示意 SVG（含对中预检层、超声复核层与施工计划动作）
   main.py        FastAPI 路由与状态机
 tests/test_flow.py       扭矩全流程与各类拒绝场景
 tests/test_alignment.py  对中拟合、证据缺口、阻断项、复测留痕、门禁、版本差异
 tests/test_ultrasonic.py 超声复核、证据缺口、重测排除、补拧派生
 tests/test_planning.py   受限栓位规划器回溯搜索、等待/换工具、无解诊断与计划修订
+tests/test_tensioning.py 张拉分轮换位、回传门禁、卸压次序载荷转移、修订与采纳超声
 samples/                 请求样例
 ```

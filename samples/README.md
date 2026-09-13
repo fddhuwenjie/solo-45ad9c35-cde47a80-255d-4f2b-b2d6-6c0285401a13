@@ -87,3 +87,39 @@ curl localhost:8000/alignment-checks/2/diff            # v1->v2 差异（按方�
 作业包 `alignment` 字段与圆周 SVG（法兰圆外菱形测点、相对倾斜虚线、
 平行度/错边/垫片偏心指标）引用同一采用版本（最新版）。
 
+
+## 液压张拉执行样例（分组同步加压）
+
+基于同一工艺（须已 approved）。建案冻结螺栓截面/目标预紧力/拉伸器能力与行程/
+压力表校准/栓组与载荷转移系数，自动生成分轮换位方案（8 栓 2 台拉伸器时第 1 轮
+为 (1,5)(2,6)(3,7)(4,8)，第 2 轮旋转换位）：
+
+```bash
+# 建案 -> 201，返回 plan.id 与分轮换位方案（含每轮设定泵压/预测行程/残余目标带）
+curl -X POST localhost:8000/procedures/1/tensioning-plans \
+     -H 'Content-Type: application/json' -d @samples/tensioning_plan.json
+curl -X POST localhost:8000/tensioning-plans/1/approve     # 批准快照（冻结）
+
+# 分组回传：各通道压力/行程、保压时段与卸压次序；换算逐栓施加载荷与
+# 预测残余预紧力（按卸压位次分配载荷转移：先卸者偏低、后卸者偏高）
+curl -X POST localhost:8000/tensioning-plans/1/round-reports \
+     -H 'Content-Type: application/json' -d @samples/tensioning_round_report.json
+
+# 超行程/压力不同步/覆盖冲突/校准失效/保压不足/残余超差 -> 409 + 栓号与原始区间；
+# 全部组回传且末轮逐栓残余入带后确认
+curl -X POST localhost:8000/tensioning-plans/1/confirm
+
+# 人工改组（须说明理由；已完成组原位锁定，只重排未完成组）
+curl -X POST localhost:8000/tensioning-plans/1/revisions \
+     -H 'Content-Type: application/json' -d @samples/tensioning_revision.json
+
+# 采用既有超声实测值（须已确认批次 + 理由，派生修订）
+curl -X POST localhost:8000/tensioning-plans/1/adopt-ultrasonic \
+     -H 'Content-Type: application/json' -d @samples/tensioning_adopt_ultrasonic.json
+
+curl localhost:8000/tensioning-plans/2                   # 当前修订详情
+curl localhost:8000/tensioning-plans/2/diff              # 与上一修订差异
+```
+
+作业包 `GET /procedures/1/package` 的 `tensioning` 字段与方案详情、版本差异
+共用同一张拉方案与结果。
