@@ -10,8 +10,53 @@ Python + FastAPI 接收请求，Pydantic 核验字段，工艺与执行版本写
 python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/uvicorn app.main:app --reload          # 默认库文件 ./flange.db
 FLANGE_DB=/path/to.db .venv/bin/uvicorn app.main:app
-.venv/bin/python -m pytest tests/ -q             # 289 个测试
+.venv/bin/python -m pytest tests/ -q             # 326 个测试
 ```
+
+## 数据库版本化迁移（PRAGMA user_version）
+
+结构由 `PRAGMA user_version` 驱动顺序迁移，不再靠一整段
+`CREATE TABLE IF NOT EXISTS` 加临时补列。每步一个可审计 SQL
+（`app/migrations/versions/0NN_*.sql`），与模块演进对应：
+
+| 版本 | 内容 |
+|---|---|
+| 1 | `procedures` / `records` / `anomalies`（最初发布结构） |
+| 2 | 超声伸长复核：测量批次、基线、读数、证据缺口、补拧草稿 |
+| 3 | 扭矩-转角轨迹：`procedures` 补轨迹复核列、`torque_curves`、`curve_revisions` |
+| 4 | 装配对中预检：`alignment_checks` / `alignment_points` |
+| 5 | 受限栓位现场约束与冻结计划：`site_constraints` / `plan_revisions` |
+| 6 | 液压张拉：`tensioning_plans` / `tensioning_reports` / `tensioning_channels` |
+| 7 | 热态预紧力校核：`thermal_cases` / `thermal_gaps` |
+
+服务启动（lifespan）调用的 `init_db()` 签名、`FLANGE_DB` 环境变量与 HTTP
+契约均未改变：空库顺序建到最新；已是最新版本则完全空操作；`user_version=0`
+的旧库（只含早期三表，或旧 `init_db()` 一次建成的全表库）按现存对象推断所属
+版本、核对完整后补盖版本号再继续升级，**重复启动不会改写任何业务数据**。
+`user_version` 高于代码已知版本（v7）时拒绝打开，避免新库被旧程序降级。
+
+**单步事务与核对**：每个迁移在一个事务内顺序执行全部语句，先核对前置
+`user_version` 与前置对象（表、列、唯一索引、外键），执行后核对目标对象、
+外键悬挂行（`PRAGMA foreign_key_check`）并在同一事务内提升 `user_version`；
+任一语句或核对失败则整步回滚，错误报告失败阶段、版本与对象清单（见
+`MigrationError.as_detail()`），下次启动从断点版本继续。
+
+**升级前检查、备份与升级**（命令行工具，不改变启动入口）：
+
+```bash
+.venv/bin/python -m app.migrate status             # 查看当前版本与结构完整性
+.venv/bin/python -m app.migrate backup -o pre.db   # SQLite 在线一致性备份（默认 flange.db.<时间戳>.bak）
+.venv/bin/python -m app.migrate migrate            # 顺序升级到最新（幂等，可重复执行）
+# 均可用 --db 指定库路径，或沿用 FLANGE_DB / 默认 ./flange.db
+```
+
+建议流程：`status` 确认版本与结构完整 → `backup` 备份 → 停服 `migrate` 升级
+→ `status` 复核（“结构核对通过”）→ 启服。升级在单步事务内完成，若某步失败
+该步整体回滚、库仍停留在上一版本，可用备份恢复后重试；跨级升级（如 v1→v7）
+与逐级升级走同一迁移链。冻结的旧库夹具在 `tests/fixtures/*.db`（由
+`tests/fixtures/build_fixtures.py` 从 `legacy_fixtures.py` 重新生成），
+`tests/test_migrations.py` 覆盖逐级/跨级升级、中断恢复、未知高版本拒绝与
+升级前后工艺、超声测量、张拉、热态记录可读。
 
 ## 输入项（POST /procedures）
 
@@ -376,10 +421,14 @@ app/
   ultrasonic.py  时差->伸长->预紧力换算、证据缺口、离散度与对径不平衡（纯函数）
   tensioning.py  张拉换算、分轮换位方案、按卸压次序分配载荷转移、回传校验与评估（纯函数）
   thermal.py     热态轴向变形协调/平衡、压缩-回弹滞回路径、证据缺口与首次越限（纯函数）
-  db.py          SQLite 模式与连接（预检/批次/轨迹/现场约束/计划修订/张拉/热态工况与缺口）
+  db.py          SQLite 连接与初始化入口（init_db 委托版本化迁移，幂等）
+  migrate.py     迁移运维 CLI：status 版本检查 / backup 备份 / migrate 升级
+  migrations/    PRAGMA user_version 顺序迁移：单步事务、前后置表列索引外键核对与回滚
+    versions/0NN_*.sql  各版本可审计 SQL（v1 基线，v2..v7 增量）
   svg.py         圆周示意 SVG（含对中预检层、超声复核层与施工计划动作）
   main.py        FastAPI 路由与状态机
-tests/test_flow.py       扭矩全流程与各类拒绝场景
+tests/test_flow.py        扭矩全流程与各类拒绝场景
+tests/test_migrations.py  版本化迁移：逐级/跨级升级、中断恢复、未知版本拒绝、备份、CLI
 tests/test_alignment.py  对中拟合、证据缺口、阻断项、复测留痕、门禁、版本差异
 tests/test_ultrasonic.py 超声复核、证据缺口、重测排除、补拧派生
 tests/test_planning.py   受限栓位规划器回溯搜索、等待/换工具、无解诊断与计划修订
