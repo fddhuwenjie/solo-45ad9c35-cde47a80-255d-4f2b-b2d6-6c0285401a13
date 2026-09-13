@@ -2541,7 +2541,8 @@ def create_thermal_revision(cid: int, body: ThermalRevisionCreate,
             "reason": f"thermal_case_{case['status']}",
             "message": f"热态工况 {cid} 当前状态 {case['status']}，不能派生修订",
         })
-    overrides = body.model_dump(exclude_none=True, exclude={"reason"})
+    overrides = json.loads(
+        body.model_dump_json(exclude_none=True, exclude={"reason"}))
     if not overrides:
         raise HTTPException(409, detail={
             "reason": "empty_revision",

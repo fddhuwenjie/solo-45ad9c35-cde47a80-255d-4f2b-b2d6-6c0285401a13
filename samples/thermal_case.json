@@ -1,0 +1,77 @@
+{
+  "source_type": "ultrasonic",
+  "bolt": {
+    "name": "B7-Stud-M24",
+    "length": 150.0,
+    "length_unit": "mm",
+    "area": 353.0,
+    "area_unit": "mm2",
+    "elastic_modulus": 206000.0,
+    "modulus_unit": "MPa",
+    "cte": 1.2e-05,
+    "prop_min_c": -50.0,
+    "prop_max_c": 400.0
+  },
+  "members": [
+    {
+      "name": "flange-near",
+      "length": 30.0,
+      "length_unit": "mm",
+      "area": 2000.0,
+      "area_unit": "mm2",
+      "elastic_modulus": 200000.0,
+      "modulus_unit": "MPa",
+      "cte": 1.2e-05,
+      "prop_min_c": -50.0,
+      "prop_max_c": 400.0
+    },
+    {
+      "name": "flange-far",
+      "length": 30.0,
+      "length_unit": "mm",
+      "area": 2000.0,
+      "area_unit": "mm2",
+      "elastic_modulus": 200000.0,
+      "modulus_unit": "MPa",
+      "cte": 1.2e-05,
+      "prop_min_c": -50.0,
+      "prop_max_c": 400.0
+    }
+  ],
+  "gasket": {
+    "name": "缠绕垫片 304+石墨",
+    "effective_area": 3500.0,
+    "area_unit": "mm2",
+    "thickness": 4.5,
+    "length_unit": "mm",
+    "cte": 1.7e-05,
+    "prop_min_c": -50.0,
+    "prop_max_c": 400.0,
+    "points": [
+      {"compression": 0.0, "loading_pressure": 0.0, "rebound_pressure": 0.0},
+      {"compression": 0.1, "loading_pressure": 10.0, "rebound_pressure": 8.0},
+      {"compression": 0.3, "loading_pressure": 30.0, "rebound_pressure": 24.0},
+      {"compression": 0.5, "loading_pressure": 50.0, "rebound_pressure": 50.0}
+    ]
+  },
+  "bolt_zones": ["Z1", "Z1", "Z1", "Z1", "Z1", "Z1", "Z1", "Z1"],
+  "reference": {"bolt_temp_c": 20.0, "member_temp_c": 20.0, "gasket_temp_c": 20.0},
+  "limits": {
+    "bolt_load_limit_kn": 180.0,
+    "min_seating_pressure_mpa": 10.0,
+    "max_gasket_pressure_mpa": 60.0,
+    "max_temperature_interval_seconds": 3600.0
+  },
+  "nodes": [
+    {"at": "2026-09-13T08:00:00", "temperatures": [
+      {"zone": "Z1", "bolt_temp_c": 20.0, "member_temp_c": 20.0, "gasket_temp_c": 20.0}
+    ]},
+    {"at": "2026-09-13T09:00:00", "temperatures": [
+      {"zone": "Z1", "bolt_temp_c": 60.0, "member_temp_c": 200.0, "gasket_temp_c": 200.0}
+    ]},
+    {"at": "2026-09-13T10:00:00", "temperatures": [
+      {"zone": "Z1", "bolt_temp_c": 100.0, "member_temp_c": 220.0, "gasket_temp_c": 220.0}
+    ]}
+  ],
+  "notes": "升温过程分区温度记录；初载取已确认超声批次逐栓载荷"
+}

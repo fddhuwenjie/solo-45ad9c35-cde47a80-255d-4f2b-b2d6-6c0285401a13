@@ -570,17 +570,9 @@ class ThermalCaseCreate(BaseModel):
         if ats != sorted(ats):
             raise ValueError("温度节点须按时刻升序提交")
         return v
-
-    @model_validator(mode="after")
-    def _check_zone_consistency(self) -> "ThermalCaseCreate":
-        assigned = set(self.bolt_zones)
-        for n in self.nodes:
-            present = {z.zone for z in n.temperatures}
-            missing = sorted(assigned - present)
-            if missing:
-                raise ValueError(
-                    f"温度节点 {n.at.isoformat()} 缺螺栓分配到的分区 {missing}")
-        return self
+    # 注：某节点缺少螺栓已分配到的分区（温度断档）不在请求级拒绝——
+    # 工况照常冻结落库，由求解器记录 temperature_gap 证据缺口（栓号+区间），
+    # 与初载缺失/材料曲线覆盖不足/单位冲突的处理一致（只记录，不判合格）。
 
 
 class ThermalRevisionCreate(BaseModel):

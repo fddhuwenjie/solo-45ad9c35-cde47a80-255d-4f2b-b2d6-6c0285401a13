@@ -227,11 +227,13 @@ class GasketCurve:
     def rebound_path_x(self, p: float, peak_p: float, peak_x: float) -> float:
         """卸载/再加载回弹路径压缩量：x = x* − x_r(p*) + x_r(p)。
 
-        仅用于 p ≤ p*；峰值压力超回弹曲线覆盖时抛 ValueError（调用方记缺口）。
+        仅用于 p ≤ p*；峰值压力超回弹曲线覆盖（含 1e-6 MPa 数值微扰容差，
+        使峰值恰处上限折点时仍可沿回弹路径求解）抛 ValueError，调用方记缺口。
         """
-        if peak_p > self.pr[-1] + 1e-12:
+        if peak_p > self.pr[-1] + 1e-6:
             raise ValueError("rebound_curve_exceeded")
-        return peak_x - self.rebound_x(peak_p) + self.rebound_x(p)
+        peak_p_clamped = min(peak_p, self.pr[-1])
+        return peak_x - self.rebound_x(peak_p_clamped) + self.rebound_x(p)
 
 
 # ---------------------------------------------------------------- 逐栓温度节点求解
@@ -307,13 +309,13 @@ def solve_bolt_series(frozen: dict, bolt_no: int, initial_load_kn: float,
     # x0 为装配状态（F0 沿加载支）的垫片压缩；变形协调始终锚定装配状态，不随
     # 历史峰值漂移；peak_p/peak_x 仅用于选择压缩-回弹支（温度路径相关）。
     peak_p = p0
-    if p0 > curve.max_loading_p + 1e-12:
+    if p0 > curve.max_loading_p + 1e-6:
         gaps.append({"reason": GAP_GASKET_CURVE, "interval": None,
                      "message": f"栓 {bolt_no} 初始面压 {round(p0, 4)}MPa 超出压缩曲线"
                                 f"上限 {curve.max_loading_p}MPa，初始压缩无法定位"})
         x0 = None
     else:
-        x0 = curve.loading_x(p0)
+        x0 = curve.loading_x(min(p0, curve.max_loading_p))
     peak_x = x0
 
     def add_material_gaps(interval: list, temps: dict) -> None:
@@ -373,50 +375,50 @@ def solve_bolt_series(frozen: dict, bolt_no: int, initial_load_kn: float,
 
         f_peak = peak_p * area_g / 1000.0
         f_max_loading = curve.max_loading_p * area_g / 1000.0
+        beyond_loading = False
 
-        # 峰值点（两分支连续）残差决定根在加载支还是回弹支。
-        # r>容差且卸载路径覆盖峰值压力时根在回弹支；数值微扰（r≈0）按加载处理。
+        # 先按加载包络外推得到“若继续加载”的载荷，判断该节点是加载还是卸载：
+        #   r_at_peak ≤ 0 -> 加载支根在峰值压力之上（继续加载）；
+        #   r_at_peak > 0 -> 根在峰值压力或以下（卸载/再加载），沿回弹路径求解。
+        # 参考节点（D≈0，r_at_peak≈0）由 |r|≤容差判为峰值即解。
         r_at_peak = res_loading(f_peak)
-        beyond_loading = rebound_unavailable = use_rebound = False
-        if r_at_peak > 1e-7:
-            try:
-                res_rebound(0.0)
-                use_rebound = True
-            except ValueError:
-                rebound_unavailable = True
-
-        if use_rebound:
-            # 根在回弹支 [0, p*]
+        if abs(r_at_peak) <= 1e-6:
+            # 峰值即解（参考节点/数值微扰）：保持峰值状态，不产生覆盖缺口
+            f_star, x_star, branch = f_peak, peak_x, "loading"
+        elif r_at_peak > 0.0:
+            # 加载支根在峰值压力或以下 -> 该节点为卸载/再加载，沿回弹路径求解
             branch = "rebound"
-            r_zero = res_rebound(0.0)
-            if r_zero >= 0.0:
-                # 回弹到零载荷仍不满足：密封面接触分离
-                f_star = 0.0
-                try:
-                    x_star = curve.rebound_path_x(0.0, peak_p, peak_x)
-                except ValueError:
-                    x_star = peak_x
-                row["states"].append(V_CONTACT_SEPARATION)
-            else:
-                f_star, _, branch = _bisect_node(
-                    0.0, f_peak,
-                    lambda f: (lambda r, x: (r, x, "rebound"))(
-                        res_rebound(f), curve.rebound_path_x(
-                            f * 1000.0 / area_g, peak_p, peak_x)),
-                    tolerance_n, max_iterations, at, bolt_no, interval, gaps, row)
-                x_star = curve.rebound_path_x(f_star * 1000.0 / area_g,
-                                              peak_p, peak_x)
-        else:
-            # 根在加载支 [p*, p_max]（含 r=0 根即峰值，与参考节点）
-            branch = "loading"
-            if rebound_unavailable:
-                # r>0 需卸载，但峰值压力超出回弹曲线覆盖：无回弹路径
+            try:
+                r_zero = res_rebound(0.0)
+            except ValueError:
+                # 历史峰值压力超出回弹曲线覆盖：无回弹路径
                 f_star, x_star = f_peak, peak_x
                 gaps.append({"reason": GAP_GASKET_CURVE, "interval": interval,
                              "message": f"栓 {bolt_no} 在 {at} 节点载荷回落（卸载），"
                                         f"但峰值面压 {round(peak_p, 4)}MPa 超出回弹曲线"
                                         f"上限 {curve.max_rebound_p}MPa，无回弹路径"})
-            elif peak_p > curve.max_loading_p + 1e-12:
+            else:
+                if r_zero >= 0.0:
+                    # 沿回弹路径卸载到零载荷仍不满足协调：密封面接触分离
+                    f_star = 0.0
+                    try:
+                        x_star = curve.rebound_path_x(0.0, peak_p, peak_x)
+                    except ValueError:
+                        x_star = peak_x
+                    row["states"].append(V_CONTACT_SEPARATION)
+                else:
+                    f_star, _, branch = _bisect_node(
+                        0.0, f_peak,
+                        lambda f: (lambda r, x: (r, x, "rebound"))(
+                            res_rebound(f), curve.rebound_path_x(
+                                f * 1000.0 / area_g, peak_p, peak_x)),
+                        tolerance_n, max_iterations, at, bolt_no, interval, gaps, row)
+                    x_star = curve.rebound_path_x(f_star * 1000.0 / area_g,
+                                                  peak_p, peak_x)
+        else:
+            # 加载支根在峰值压力之上 -> 继续沿加载支升高
+            branch = "loading"
+            if peak_p > curve.max_loading_p + 1e-6:
                 f_star, x_star = f_peak, peak_x  # 初始覆盖缺口已记录
             elif res_loading(f_max_loading) < 0.0:
                 f_star = f_max_loading
@@ -434,9 +436,12 @@ def solve_bolt_series(frozen: dict, bolt_no: int, initial_load_kn: float,
                 x_star = curve.loading_x(f_star * 1000.0 / area_g)
 
         p_star = f_star * 1000.0 / area_g
+        # 沿加载支升高时更新历史峰值（供后续卸载节点选择回弹路径）；钳制到
+        # 压缩曲线上限折点，避免 p0/解恰在上限时的数值微扰把峰值推出曲线覆盖。
         if (not beyond_loading and branch == "loading"
                 and p_star > peak_p + 1e-9):
-            peak_p, peak_x = p_star, x_star  # 沿加载支升高，更新历史峰值（供后续节点）
+            peak_p = min(p_star, curve.max_loading_p)
+            peak_x = curve.loading_x(peak_p)
 
         if f_star <= 1e-9 and V_CONTACT_SEPARATION not in row["states"]:
             row["states"].append(V_CONTACT_SEPARATION)

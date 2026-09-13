@@ -123,3 +123,32 @@ curl localhost:8000/tensioning-plans/2/diff              # 与上一修订差异
 
 作业包 `GET /procedures/1/package` 的 `tensioning` 字段与方案详情、版本差异
 共用同一张拉方案与结果。
+
+## 热态预紧力校核样例（升温后的变形协调）
+
+常温扭矩/液压张拉或超声复核合格后，螺栓、夹持件与垫片热膨胀不同步仍可能导致
+螺栓过载、垫片压溃或密封面分离。基于已确认超声批次（或已确认张拉方案）的
+逐栓初始载荷建案，冻结各部件长度/截面/E/热膨胀系数/物性温度区间、垫片有效
+面积与压缩-回弹曲线、限值与带时标分区温度：
+
+```bash
+# 建案（初载缺省取最新已确认来源；source_id 可显式指定批次/方案）-> 201
+curl -X POST localhost:8000/procedures/1/thermal-cases \
+     -H 'Content-Type: application/json' -d @samples/thermal_case.json
+curl localhost:8000/thermal-cases/1                     # 冻结参数 + 逐时结果
+curl -X POST localhost:8000/thermal-cases/1/confirm \
+     -H 'Content-Type: application/json' \
+     -d '{"reviewer":"热工","note":"升温全程合格"}'
+
+# 证据缺口/越限（初载缺失、温度断档、材料/垫片曲线覆盖不足、单位冲突、
+# 接触分离/压溃/螺栓超载/密封裕量不足）-> 工况照常落库但不可确认，
+# 确认返回 409 并列出栓号与对应区间
+# 人工采用替代边界/材料曲线必须写明理由，派生修订（旧修订废止不覆盖）
+curl -X POST localhost:8000/thermal-cases/1/revisions \
+     -H 'Content-Type: application/json' -d @samples/thermal_revision.json
+curl localhost:8000/thermal-cases/2/diff                # 与上一修订差异
+curl localhost:8000/procedures/1/thermal-cases          # 修订链
+```
+
+作业包 `GET /procedures/1/package` 的 `thermal` 字段与工况详情、版本差异
+共用同一所选版本的冻结参数、逐时结果与人工决定。

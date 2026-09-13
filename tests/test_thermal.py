@@ -3,6 +3,8 @@
 修订（替代边界/曲线须写理由）、版本差异与作业包一致性。"""
 from __future__ import annotations
 
+import copy
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -77,12 +79,11 @@ def zone(zone_name, tb=20.0, tm=20.0, tg=20.0):
 def thermal_payload(*, bolt_zones=None, nodes=None, **overrides):
     payload = {
         "source_type": "ultrasonic",
-        "bolt": dict(BOLT), "members": [dict(m) for m in MEMBERS],
-        "gasket": {"name": "spw",
-                   **{k: (list(v) if isinstance(v, list) else v)
-                      for k, v in GASKET.items()}},
+        "bolt": copy.deepcopy(BOLT),
+        "members": copy.deepcopy(MEMBERS),
+        "gasket": {"name": "spw", **copy.deepcopy(GASKET)},
         "bolt_zones": bolt_zones or ["Z1"] * 8,
-        "reference": dict(REF), "limits": dict(LIMITS),
+        "reference": copy.deepcopy(REF), "limits": copy.deepcopy(LIMITS),
         "nodes": nodes or [
             {"at": "2026-09-13T08:00:00", "temperatures": [zone("Z1")]},
             {"at": "2026-09-13T09:00:00",
@@ -108,13 +109,18 @@ def test_reference_node_recovers_initial_load():
 
 def test_linear_compatibility_against_hand_calc():
     """线性段协调方程与手算一致：(F−F0)·c_s + (x−x0) = D。"""
-    payload = thermal_payload()
-    frozen = normalize_case(payload)
-    temps = {"bolt_temp_c": 120.0, "member_temp_c": 200.0,
+    temps = {"bolt_temp_c": 60.0, "member_temp_c": 200.0,
              "gasket_temp_c": 200.0}
+    payload = thermal_payload(nodes=[
+        {"at": "2026-09-13T08:00:00", "temperatures": [zone("Z1")]},
+        {"at": "2026-09-13T09:00:00", "temperatures": [zone("Z1", **{
+            "tb": temps["bolt_temp_c"], "tm": temps["member_temp_c"],
+            "tg": temps["gasket_temp_c"]})]}])
+    frozen = normalize_case(payload)
+    # 夹持件/垫片 200℃、螺栓 60℃：D>0（夹持件膨胀占优），根在加载支
     D = thermal_mismatch_mm(frozen, temps)
-    # D = 1.2e-5·(60·180 − 150·100) + 1.7e-5·4.5·180
-    assert D == pytest.approx(1.2e-5 * (60 * 180 - 150 * 100) + 1.7e-5 * 4.5 * 180)
+    # D = 1.2e-5·(60·180 − 150·40) + 1.7e-5·4.5·180
+    assert D == pytest.approx(1.2e-5 * (60 * 180 - 150 * 40) + 1.7e-5 * 4.5 * 180)
     area_g = 3500.0
     c_b = 150.0 / (206000.0 * 353.0)
     c_s = c_b + member_compliance_mm_per_n(frozen)
@@ -123,26 +129,54 @@ def test_linear_compatibility_against_hand_calc():
     f_expect = 140.0 + D / (c_s * 1000.0 + kx_per_kn)
     res = evaluate_case(frozen, {str(b): 140.0 for b in range(1, 9)}, 8)
     got = res["bolts"][0]["series"][1]
-    # D>0 -> 加载支
     assert got["branch"] == "loading"
     assert got["thermal_load_kn"] == pytest.approx(f_expect, rel=1e-4)
 
 
 def test_cooling_unloads_with_rebound_hysteresis():
-    """降温 D<0 沿回弹支卸载：同一压力下压缩更大（残余压缩/滞回）。"""
-    payload = thermal_payload(nodes=[
-        {"at": "2026-09-13T08:00:00", "temperatures": [zone("Z1")]},
-        {"at": "2026-09-13T08:30:00",
-         "temperatures": [zone("Z1", tb=200.0, tm=200.0, tg=200.0)]},
-        {"at": "2026-09-13T09:00:00", "temperatures": [zone("Z1")]}])
+    """升温加载后再降温：卸载沿平移后的回弹路径，载荷/压缩不再沿加载支原路返回。"""
+    hysteresis_gasket = {
+        "effective_area": 3500.0, "thickness": 4.5, "cte": 1.7e-5,
+        "prop_min_c": -50.0, "prop_max_c": 400.0,
+        "points": [
+            {"compression": 0.0, "loading_pressure": 0.0, "rebound_pressure": 0.0},
+            {"compression": 0.5, "loading_pressure": 100.0,
+             "rebound_pressure": 80.0}],
+    }
+    payload = thermal_payload(
+        gasket={"name": "hysteresis", **hysteresis_gasket},
+        nodes=[
+            {"at": "2026-09-13T08:00:00", "temperatures": [zone("Z1")]},
+            {"at": "2026-09-13T08:30:00",
+             "temperatures": [zone("Z1", tb=20.0, tm=100.0, tg=100.0)]},
+            {"at": "2026-09-13T09:00:00", "temperatures": [zone("Z1")]}])
     frozen = normalize_case(payload)
     res = evaluate_case(frozen, {str(b): 140.0 for b in range(1, 9)}, 8)
-    heat_row, cool_row = res["bolts"][0]["series"][1], res["bolts"][0]["series"][2]
+    heat_row, cool_row = res["bolts"][0]["series"][1:]
+    # 夹持件更热 -> 继续沿加载支升高
+    assert heat_row["branch"] == "loading"
     assert heat_row["thermal_load_kn"] > 140.0
-    # 回到参考温度但路径经过峰值：回弹支 x(p)=x*−x_r(p*)+x_r(p)，与初载不同
+    peak_p = heat_row["gasket_pressure_mpa"]
+    # 回到参考温度：沿过峰值的回弹路径卸载（路径相关，非加载支原路）
     assert cool_row["branch"] == "rebound"
-    assert cool_row["thermal_load_kn"] < 140.0
-    assert cool_row["gasket_compression_mm"] > 0.4  # 永久压缩变形
+    assert cool_row["gasket_pressure_mpa"] < peak_p
+    assert res["confirmable"] is True
+
+
+def test_rebound_curve_boundary_tolerance():
+    """峰值面压恰处回弹曲线上限折点时数值微扰不触发曲线覆盖缺口，求解继续。"""
+    payload = thermal_payload(
+        nodes=[
+            {"at": "2026-09-13T08:00:00", "temperatures": [zone("Z1")]},
+            {"at": "2026-09-13T09:00:00",
+             "temperatures": [zone("Z1", tb=120.0, tm=200.0, tg=200.0)]}])
+    frozen = normalize_case(payload)
+    res = evaluate_case(frozen, {str(b): 140.0 for b in range(1, 9)}, 8)
+    # 初载面压 p0=40MPa 恰为回弹曲线上限；第 2 节点小幅卸载须能沿回弹路径求解
+    assert "gasket_curve_coverage" not in res["gap_reasons"]
+    row = res["bolts"][0]["series"][1]
+    assert row["branch"] == "rebound"
+    assert row["thermal_load_kn"] > 0
 
 
 def test_gasket_curve_rebound_form_passes_peak():
@@ -351,7 +385,8 @@ def test_diff_detects_frozen_param_timeline_and_load_changes():
                              for b in range(1, 9)},
            "change_note": "改用张拉方案初载"}
     d = diff_cases(old, new)
-    assert d["initial_load_source"]["to"] == {"type": "tensioning", "id": 2}
+    assert d["param_changes"]["initial_load_source"]["to"] == \
+        {"type": "tensioning", "id": 2}
     assert d["initial_load_changes_kn"]["1"] == {"from": 140.0, "to": 130.0}
     assert "2026-09-13T08:30:00" in d["timeline"]["added_nodes"]
     assert d["change_note"] == "改用张拉方案初载"
@@ -376,11 +411,11 @@ def test_schema_rejects_unordered_nodes_and_curve():
     bad_rebound["gasket"]["points"][1]["rebound_pressure"] = 55.0
     with pytest.raises(ValueError):
         ThermalCaseCreate(**bad_rebound)
-    # 节点缺已分配分区 -> 422
-    bad_zone = thermal_payload(bolt_zones=["Z1"] * 4 + ["Z2"] * 4)
-    bad_zone["nodes"][0]["temperatures"] = [zone("Z1")]
-    with pytest.raises(ValueError):
-        ThermalCaseCreate(**bad_zone)
+    # 节点缺已分配分区：请求级不再拒绝（与初载缺失等证据缺口一致），
+    # 工况照常冻结，由求解器记录 temperature_gap（见端到端回归测试）
+    missing_zone = thermal_payload(bolt_zones=["Z1"] * 4 + ["Z2"] * 4)
+    missing_zone["nodes"][0]["temperatures"] = [zone("Z1")]
+    ThermalCaseCreate(**missing_zone)  # 不抛异常
 
 
 # ---------------------------------------------------------------- 端到端
@@ -523,7 +558,7 @@ def test_create_from_tensioning_source(client):
     assert r.status_code == 201, r.text
     detail = r.json()
     assert detail["case"]["source_type"] == "tensioning"
-    assert set(detail["initial_loads_kn"]) == set(range(1, 9))
+    assert {int(k) for k in detail["initial_loads_kn"]} == set(range(1, 9))
     assert detail["initial_loads_kn"]["1"] == pytest.approx(140.0, abs=0.01)
     # 默认来源（不带 source_id）取最新已确认
     payload2 = thermal_payload(source_type="tensioning")
@@ -590,6 +625,52 @@ def test_bolt_zone_count_mismatch_422(client):
                     json=thermal_payload(source_id=bid, bolt_zones=["Z1"] * 7))
     assert r.status_code == 422
     assert r.json()["detail"]["reason"] == "bolt_zone_count_mismatch"
+
+
+def test_missing_zone_temperature_stored_as_gap_not_rejected(client):
+    """温度节点缺已分配的 Z2 分区时请求级不拒绝：工况与缺口落库（201），
+    列出受影响栓号与断档区间，工况不可确认；Z1 栓该节点仍正常求解。"""
+    pid = make_approved_proc(client)
+    bid = confirm_ultrasonic(client, pid)
+    payload = thermal_payload(
+        source_id=bid,
+        bolt_zones=["Z1"] * 4 + ["Z2"] * 4,
+        nodes=[{"at": "2026-09-13T08:00:00",
+                "temperatures": [zone("Z1"), zone("Z2")]},
+               {"at": "2026-09-13T09:00:00",
+                "temperatures": [zone("Z1", tb=120.0, tm=200.0, tg=200.0)]}])
+    r = client.post(f"/procedures/{pid}/thermal-cases", json=payload)
+    assert r.status_code == 201, r.text
+    detail = r.json()
+    assert detail["result"]["confirmable"] is False
+    assert "temperature_gap" in detail["result"]["blockers"]
+
+    bolts = {b["bolt_no"]: b for b in detail["result"]["bolts"]}
+    # Z2 栓（5..8）在第 2 节点缺温度：缺口定位栓号与区间
+    z2_gap = next(g for g in bolts[5]["gaps"] if g["reason"] == "temperature_gap")
+    assert z2_gap["interval"] == ["2026-09-13T09:00:00", "2026-09-13T09:00:00"]
+    assert bolts[5]["series"][1]["states"] == ["temperature_missing"]
+    # Z1 栓（1..4）该节点温度齐全，正常求解
+    assert bolts[1]["series"][1]["thermal_load_kn"] is not None
+    assert not any(g["reason"] == "temperature_gap" for g in bolts[1]["gaps"])
+
+    # 缺口逐条落 thermal_gaps 留痕
+    cid = detail["case"]["id"]
+    stored_gaps = client.get(f"/thermal-cases/{cid}").json()["gaps"]
+    z2_stored = [g for g in stored_gaps if g["bolt_no"] in range(5, 9)]
+    assert all(g["reason"] == "temperature_gap" for g in z2_stored)
+    assert all(g["interval"] == ["2026-09-13T09:00:00", "2026-09-13T09:00:00"]
+               for g in z2_stored)
+
+    # 确认被拒：返回 blockers 与逐栓/区间明细，工况保持 open
+    r = client.post(f"/thermal-cases/{cid}/confirm", json={"reviewer": "r"})
+    assert r.status_code == 409
+    assert r.json()["detail"]["reason"] == "thermal_case_not_confirmed"
+    flagged = {b["bolt_no"]: b for b in r.json()["detail"]["bolts"]}
+    assert 5 in flagged
+    assert flagged[5]["gaps"][0]["interval"] == \
+        ["2026-09-13T09:00:00", "2026-09-13T09:00:00"]
+    assert client.get(f"/thermal-cases/{cid}").json()["case"]["status"] == "open"
 
 
 def test_revision_requires_reason_and_change(client):

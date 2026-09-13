@@ -1,0 +1,25 @@
+{
+  "reason": "现场复核为加厚缠绕垫片，按实测压缩-回弹曲线替换垫片并放宽压溃面压；替代依据见垫片质保书 SPW-2026-031",
+  "limits": {
+    "bolt_load_limit_kn": 180.0,
+    "min_seating_pressure_mpa": 10.0,
+    "max_gasket_pressure_mpa": 80.0,
+    "max_temperature_interval_seconds": 3600.0
+  },
+  "gasket": {
+    "name": "加厚缠绕垫片 304+石墨",
+    "effective_area": 3500.0,
+    "area_unit": "mm2",
+    "thickness": 5.5,
+    "length_unit": "mm",
+    "cte": 1.7e-05,
+    "prop_min_c": -50.0,
+    "prop_max_c": 450.0,
+    "points": [
+      {"compression": 0.0, "loading_pressure": 0.0, "rebound_pressure": 0.0},
+      {"compression": 0.15, "loading_pressure": 10.0, "rebound_pressure": 8.0},
+      {"compression": 0.4, "loading_pressure": 30.0, "rebound_pressure": 26.0},
+      {"compression": 0.7, "loading_pressure": 70.0, "rebound_pressure": 60.0}
+    ]
+  }
+}
