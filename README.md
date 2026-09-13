@@ -10,7 +10,7 @@ Python + FastAPI 接收请求，Pydantic 核验字段，工艺与执行版本写
 python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/uvicorn app.main:app --reload          # 默认库文件 ./flange.db
 FLANGE_DB=/path/to.db .venv/bin/uvicorn app.main:app
-.venv/bin/python -m pytest tests/ -q             # 123 个测试
+.venv/bin/python -m pytest tests/ -q             # 139 个测试
 ```
 
 ## 输入项（POST /procedures）
@@ -187,6 +187,44 @@ n=4 数学上无法生成全程非相邻序列（1-3-2-4 中 3→2 相邻），�
 `GET /procedures/{id}/diagram.svg` 引用**同一测量版本**（已确认优先，否则当前
 开放批次）；SVG 用绿/橙双环标出每栓超声结论与换算载荷（kN）。
 
+## 受限栓位施工规划（现场障碍下的分轮排序）
+
+现场脚手架、管托或扳手反力臂会挡住部分栓位，等分圆周的固定交叉序列可能排出
+当班无法执行的步骤；临时跳栓又会破坏分轮受力。草稿阶段可为每颗螺栓登记
+**实际方位、可操作时间窗、允许工具及套筒/反力臂所需角区**，规划器在分轮递增
+框架内重排每轮顺序；未登记任何约束时仍按规则圆周展开
+（`bolt_count`、`start_angle_deg`、`clockwise` 输入行为不变）。
+
+`PUT /procedures/{id}/constraints`（仅 draft，整组替换、逐版留痕）：
+
+| 字段 | 说明 |
+|---|---|
+| `shift_start` | 排程起点（当班开始时刻） |
+| `min_separation_deg` | 同轮连续两步最小角间隔；缺省复现同轮非相邻规则（360/N） |
+| `step_minutes` / `tool_change_minutes` | 单栓作业时长 / 换工具耗时（分钟） |
+| `tool_windows` | 工具可用时段（工具被其他作业占用时）；未登记的工具全时段可用 |
+| `bolts[].angle_deg` | 实际方位角；缺省按规则圆周展开 |
+| `bolts[].windows` | 该栓可操作时间窗；空 = 全时段 |
+| `bolts[].allowed_tools` | 允许工具列表；缺省 = 仅批准工具 |
+| `bolts[].clearance_deg` | 套筒/反力臂所需角区半宽（连续两步角距须 ≥ 两栓角区之和） |
+
+规划器约束（`app/planning.py`，纯函数）：每轮所有栓恰好出现一次
+（**不得用跳过螺栓伪造可行方案**）；同轮连续两步角距 ≥ max（最小角间隔，
+两栓角区之和）；轮内顺序用**带回溯的深度优先搜索**确定——对径优先只是
+选序偏好，贪心走不通时回溯尝试其他候选，全部候选顺序都失败才判定无解；
+时间/工具不可行时生成**等待**或**换工具**动作。无解返回 `plan_infeasible`
+（首个冲突轮次、受阻栓位、最少需解除的限制；与顺序无关的时间窗/工具失效
+优先于搜索死胡同诊断）。
+
+- 批准时冻结计划 v1（`plan_revisions` 表）；草稿预览与批准门禁共用同一规划器，
+  预览/批准不可行即 409；
+- 批准后约束随计划冻结（PUT 返回 `constraints_locked`）；现场障碍或工具变化须
+  `POST /procedures/{id}/plan-revisions` 从批准版派生修订——**已完成步骤原位锁定
+  （时刻/工具/轮内次序不变），只重排未完成步骤**；无解即 409，当前冻结计划不变；
+- 回传按计划顺序与**计划步骤锁定工具**校验（换工具步骤须用计划工具）；
+  恢复序列、JSON 作业包（`planning` 字段）与圆周 SVG（实际方位、角区虚线弧、
+  等待/换工具动作清单）读取同一冻结计划。
+
 ## 版本与修订链
 
 批准后参数锁定（PUT 仅草稿可用）；目标或工具变化须
@@ -202,16 +240,18 @@ n=4 数学上无法生成全程非相邻序列（1-3-2-4 中 3→2 相邻），�
 
 ```
 app/
-  schemas.py     Pydantic 输入核验（工艺 + 超声 + 对中预检 + 轨迹）
+  schemas.py     Pydantic 输入核验（工艺 + 超声 + 对中预检 + 轨迹 + 现场约束）
   sequencing.py  交叉顺序与分轮计划（支持补拧锁定螺栓过滤）
+  planning.py    受限栓位规划器：回溯搜索排序、等待/换工具动作、无解诊断（纯函数）
   alignment.py   间隙面/径向/垫片偏心最小二乘拟合、证据缺口、阻断项、版本差异（纯函数）
   rules.py       回传校验规则（纯函数）
   ultrasonic.py  时差->伸长->预紧力换算、证据缺口、离散度与对径不平衡（纯函数）
-  db.py          SQLite 模式与连接（预检版本/测点、批次/基线/读数/缺口/补拧作业）
-  svg.py         圆周示意 SVG（含对中预检层与超声复核层）
+  db.py          SQLite 模式与连接（预检版本/测点、批次/基线/读数/缺口/补拧作业/现场约束/计划修订）
+  svg.py         圆周示意 SVG（含对中预检层、超声复核层与施工计划动作）
   main.py        FastAPI 路由与状态机
 tests/test_flow.py       扭矩全流程与各类拒绝场景
 tests/test_alignment.py  对中拟合、证据缺口、阻断项、复测留痕、门禁、版本差异
 tests/test_ultrasonic.py 超声复核、证据缺口、重测排除、补拧派生
+tests/test_planning.py   受限栓位规划器回溯搜索、等待/换工具、无解诊断与计划修订
 samples/                 请求样例
 ```

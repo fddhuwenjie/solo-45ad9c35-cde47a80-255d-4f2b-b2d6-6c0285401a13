@@ -6,12 +6,15 @@
 
 - 每轮所有（非补拧锁定）螺栓恰好出现一次——不得用跳过螺栓伪造可行方案；
 - 同轮连续两步的圆周角距 ≥ max(最小角间隔, 两栓套筒/反力臂角区半宽之和)；
-- 下一步优先取与上一栓最接近对径（180°）的可用栓（对径优先）；
+- 轮内顺序用带回溯的深度优先搜索确定：对径优先（与上一栓最接近 180°）
+  只是选序偏好，贪心走不通时回溯尝试其他候选，全部候选顺序
+  （满足角距、角区、时间窗、工具时段与已完成前缀）都失败才判定无解；
 - 紧固时刻须落在栓位可操作时间窗与所用工具可用时段的交集内；
   当前时刻无可行栓时生成等待动作，备用工具更早可用时生成换工具动作；
 - 修订时已完成步骤原位锁定（时刻、工具、轮内次序不变），只重排未完成步骤。
 
-无解时抛出 PlanInfeasible，携带首个冲突轮次、受阻栓位与最少需解除的限制。
+无解时抛出 PlanInfeasible，携带首个冲突轮次、受阻栓位与最少需解除的限制；
+与顺序无关的时间窗/工具失效（排程起点前已全部结束）优先于搜索死胡同诊断。
 """
 from __future__ import annotations
 
@@ -105,6 +108,20 @@ def _earliest_with_tool(site: BoltSite, tool_windows: dict[str, list],
         if s is not None and (best is None or s < best[0]):
             best = (s, tl)
     return best if best else (None, None)
+
+
+def _tool_options(site: BoltSite, tool_windows: dict[str, list],
+                  t: datetime, cur_tool: str, step_minutes: float,
+                  change_minutes: float) -> list[tuple[datetime, str]]:
+    """该栓每个允许工具的最早可行时刻，按（开始时刻、优先当前工具）排序。"""
+    options: list[tuple[datetime, str]] = []
+    for tl in site.allowed_tools:
+        start_t = t if tl == cur_tool else t + timedelta(minutes=change_minutes)
+        s = earliest_start(site.windows, tool_windows.get(tl) or [], start_t, step_minutes)
+        if s is not None:
+            options.append((s, tl))
+    options.sort(key=lambda o: (o[0], o[1] != cur_tool))
+    return options
 
 
 def _required_separation(min_sep: float, a: BoltSite, b: BoltSite) -> float:
@@ -206,6 +223,113 @@ def _diagnose_time(cands: list[int], sites: dict[int, BoltSite],
     return blocked, relaxations
 
 
+class _DeadEnd:
+    """搜索过程中记录的最深死胡同（剩余栓最少），供无解诊断。"""
+
+    def __init__(self) -> None:
+        self.remaining: list[int] | None = None
+        self.prev_bolt: int | None = None
+        self.kind: str | None = None          # "angular" | "time"
+        self.cands: list[int] = []
+        self.t: datetime | None = None
+        self.tool: str | None = None
+
+    def update(self, remaining: list[int], prev_bolt: int | None, kind: str,
+               cands: list[int], t: datetime, tool: str) -> None:
+        if self.remaining is None or len(remaining) < len(self.remaining):
+            self.remaining = list(remaining)
+            self.prev_bolt = prev_bolt
+            self.kind = kind
+            self.cands = list(cands)
+            self.t = t
+            self.tool = tool
+
+
+def _search_round(*, round_no: int, ratio: float, target_torque: float,
+                  remaining: list[int], prev_bolt: int | None, t: datetime,
+                  tool: str, order: int, sites: dict[int, BoltSite],
+                  min_sep: float, step: timedelta, change: timedelta,
+                  tool_windows: dict[str, list], step_minutes: float,
+                  tool_change_minutes: float, dead_end: _DeadEnd,
+                  ) -> tuple[list[dict], list[dict], datetime, str] | None:
+    """轮内深度优先搜索：对径优先只是选序偏好，失败即回溯尝试其他候选。
+
+    返回 (steps, actions, 结束时刻, 结束工具)；全部候选顺序均不可行时返回 None，
+    最深的死胡同已写入 dead_end。
+    """
+    if not remaining:
+        return ([], [], t, tool)
+    cands = [
+        b for b in remaining
+        if prev_bolt is None
+        or circular_angle_distance(sites[prev_bolt].angle_deg, sites[b].angle_deg)
+        >= _required_separation(min_sep, sites[prev_bolt], sites[b])
+    ]
+    if not cands:
+        dead_end.update(remaining, prev_bolt, "angular", [], t, tool)
+        return None
+    # 对径优先：与上一栓角距最接近 180° 者优先，并列按栓号
+    cands.sort(key=lambda b: (
+        abs(circular_angle_distance(sites[prev_bolt].angle_deg,
+                                    sites[b].angle_deg) - 180.0)
+        if prev_bolt is not None else 0.0, b))
+    # 分支排序：当前工具立即可行的候选优先（对径序），其余按最早开始时刻
+    immediate: list[tuple[int, datetime, str]] = []
+    deferred: list[tuple[datetime, int, int, str]] = []
+    for rank, b in enumerate(cands):
+        for s, tl in _tool_options(sites[b], tool_windows, t, tool,
+                                   step_minutes, tool_change_minutes):
+            if tl == tool and s <= t + _EPS:
+                immediate.append((b, s, tl))
+            else:
+                deferred.append((s, rank, b, tl))
+    deferred.sort(key=lambda x: (x[0], x[1]))
+    branches: list[tuple[int, datetime, str]] = (
+        [(b, s, tl) for b, s, tl in immediate]
+        + [(b, s, tl) for s, _rank, b, tl in deferred])
+    for b, s, tl in branches:
+        sub = _search_round(
+            round_no=round_no, ratio=ratio, target_torque=target_torque,
+            remaining=[x for x in remaining if x != b], prev_bolt=b,
+            t=s + step, tool=tl, order=order + 1, sites=sites, min_sep=min_sep,
+            step=step, change=change, tool_windows=tool_windows,
+            step_minutes=step_minutes, tool_change_minutes=tool_change_minutes,
+            dead_end=dead_end)
+        if sub is None:
+            continue
+        sub_steps, sub_actions, end_t, end_tool = sub
+        acts: list[dict] = []
+        eff = s - (change if tl != tool else timedelta(0))
+        if eff > t + _EPS:
+            acts.append({
+                "kind": "wait",
+                "from": t.isoformat(timespec="seconds"),
+                "until": eff.isoformat(timespec="seconds"),
+                "minutes": round((eff - t).total_seconds() / 60.0, 2),
+                "reason": "等待栓位时间窗或工具可用时段",
+            })
+        if tl != tool:
+            acts.append({
+                "kind": "tool_change", "from_tool": tool, "to_tool": tl,
+                "at": eff.isoformat(timespec="seconds"),
+                "minutes": tool_change_minutes,
+            })
+        step_dict = {
+            "round_no": round_no,
+            "order_in_round": order + 1,
+            "bolt_no": b,
+            "ratio": ratio,
+            "target_torque": round(target_torque * ratio, 2),
+            "tool_id": tl,
+            "scheduled_at": s.isoformat(timespec="seconds"),
+            "angle_deg": sites[b].angle_deg,
+        }
+        return ([step_dict] + sub_steps, acts + sub_actions, end_t, end_tool)
+    # 所有候选顺序均失败：本层也是死胡同（更深的失败优先保留）
+    dead_end.update(remaining, prev_bolt, "time", cands, t, tool)
+    return None
+
+
 def schedule_plan(*, bolt_count: int, stage_ratios: list[float], target_torque: float,
                   sites: dict[int, BoltSite], min_separation_deg: float | None,
                   step_minutes: float, tool_change_minutes: float,
@@ -219,6 +343,8 @@ def schedule_plan(*, bolt_count: int, stage_ratios: list[float], target_torque: 
     locked_bolts：补拧锁定螺栓，不生成步骤。
     返回 (steps, actions)；steps 元素兼容 build_plan 字段并增加
     tool_id / scheduled_at / angle_deg。
+    轮内顺序用带回溯的搜索确定：对径优先仅为选序偏好，全部候选顺序
+    （满足角距、角区、时间窗、工具时段与已完成前缀）都失败才判定无解。
     """
     min_sep = (min_separation_deg if min_separation_deg is not None
                else default_min_separation(bolt_count))
@@ -244,76 +370,45 @@ def schedule_plan(*, bolt_count: int, stage_ratios: list[float], target_torque: 
         prev_bolt = round_locked[-1]["bolt_no"] if round_locked else None
         remaining = [b for b in all_bolts if (round_no, b) not in locked_keys]
         order = max((s["order_in_round"] for s in round_locked), default=0)
-        while remaining:
-            cands = [
+        dead_end = _DeadEnd()
+        result = _search_round(
+            round_no=round_no, ratio=ratio, target_torque=target_torque,
+            remaining=remaining, prev_bolt=prev_bolt, t=t, tool=tool,
+            order=order, sites=sites, min_sep=min_sep, step=step, change=change,
+            tool_windows=tool_windows, step_minutes=step_minutes,
+            tool_change_minutes=tool_change_minutes, dead_end=dead_end)
+        if result is None:
+            # 先查与顺序无关的不可行栓：其时间窗/允许工具时段在排程起点前
+            # 已全部结束，任何候选顺序都无法放行——直接作为根因诊断，
+            # 不被搜索过程中产生的角间隔假象掩盖
+            orderless = [
                 b for b in remaining
-                if prev_bolt is None
-                or circular_angle_distance(sites[prev_bolt].angle_deg,
-                                           sites[b].angle_deg)
-                >= _required_separation(min_sep, sites[prev_bolt], sites[b])
+                if _earliest_with_tool(sites[b], tool_windows, t, default_tool,
+                                       step_minutes, tool_change_minutes)[0] is None
             ]
-            if not cands:
-                blocked, relax = _diagnose_angular(prev_bolt, remaining, sites, min_sep)
+            if orderless:
+                blocked, relax = _diagnose_time(
+                    orderless, sites, tool_windows, t,
+                    step_minutes, tool_change_minutes, default_tool)
                 raise PlanInfeasible(
                     round_no, blocked, relax,
-                    f"第 {round_no} 轮：栓 {prev_bolt} 之后无任何栓位满足最小角间隔"
-                    f"/角区约束（剩余 {len(remaining)} 栓），拒绝跳过螺栓伪造方案")
-            # 对径优先：与上一栓角距最接近 180° 者优先，并列按栓号
-            cands.sort(key=lambda b: (
-                abs(circular_angle_distance(sites[prev_bolt].angle_deg,
-                                            sites[b].angle_deg) - 180.0)
-                if prev_bolt is not None else 0.0, b))
-            chosen: tuple[datetime, str, int] | None = None
-            fallback: tuple[datetime, str, int] | None = None
-            for b in cands:
-                s, tl = _earliest_with_tool(sites[b], tool_windows, t, tool,
-                                            step_minutes, tool_change_minutes)
-                if s is None:
-                    continue
-                if tl == tool and s <= t + _EPS:
-                    chosen = (s, tl, b)  # 当前工具立即可行：按对径优先顺序取用
-                    break
-                if fallback is None or s < fallback[0]:
-                    fallback = (s, tl, b)
-            if chosen is None:
-                chosen = fallback  # 都需等待/换工具：取全局最早
-            if chosen is None:
-                blocked, relax = _diagnose_time(cands, sites, tool_windows, t,
-                                                step_minutes, tool_change_minutes, tool)
-                raise PlanInfeasible(
-                    round_no, blocked, relax,
-                    f"第 {round_no} 轮：候选栓位的时间窗/工具可用时段均不可行，"
+                    f"第 {round_no} 轮：栓 {orderless} 的时间窗/允许工具时段"
+                    "在排程起点前已全部结束，任何顺序都无法放行，"
                     "拒绝跳过螺栓伪造方案")
-            s, tl, b = chosen
-            eff = s - (change if tl != tool else timedelta(0))
-            if eff > t + _EPS:
-                actions.append({
-                    "kind": "wait",
-                    "from": t.isoformat(timespec="seconds"),
-                    "until": eff.isoformat(timespec="seconds"),
-                    "minutes": round((eff - t).total_seconds() / 60.0, 2),
-                    "reason": "等待栓位时间窗或工具可用时段",
-                })
-            if tl != tool:
-                actions.append({
-                    "kind": "tool_change", "from_tool": tool, "to_tool": tl,
-                    "at": eff.isoformat(timespec="seconds"),
-                    "minutes": tool_change_minutes,
-                })
-            order += 1
-            steps.append({
-                "round_no": round_no,
-                "order_in_round": order,
-                "bolt_no": b,
-                "ratio": ratio,
-                "target_torque": round(target_torque * ratio, 2),
-                "tool_id": tl,
-                "scheduled_at": s.isoformat(timespec="seconds"),
-                "angle_deg": sites[b].angle_deg,
-            })
-            t = s + step
-            tool = tl
-            prev_bolt = b
-            remaining.remove(b)
-        prev_bolt = None  # 角间隔只约束同轮连续步骤，跨轮不延续
+            if dead_end.kind == "angular":
+                blocked, relax = _diagnose_angular(
+                    dead_end.prev_bolt, dead_end.remaining, sites, min_sep)
+                message = (f"第 {round_no} 轮：栓 {dead_end.prev_bolt} 之后无任何栓位"
+                           f"满足最小角间隔/角区约束（剩余 {len(dead_end.remaining)} 栓），"
+                           "已搜索全部候选顺序，拒绝跳过螺栓伪造方案")
+            else:
+                blocked, relax = _diagnose_time(
+                    dead_end.cands, sites, tool_windows, dead_end.t,
+                    step_minutes, tool_change_minutes, dead_end.tool)
+                message = (f"第 {round_no} 轮：候选栓位的时间窗/工具可用时段均不可行，"
+                           "已搜索全部候选顺序，拒绝跳过螺栓伪造方案")
+            raise PlanInfeasible(round_no, blocked, relax, message)
+        round_steps, round_actions, t, tool = result
+        steps.extend(round_steps)
+        actions.extend(round_actions)
     return steps, actions

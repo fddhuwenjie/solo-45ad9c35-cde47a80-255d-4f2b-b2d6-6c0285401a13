@@ -431,7 +431,8 @@ def test_failed_batch_derives_rework_locking_good_bolts(client):
     assert body["rework_procedure"]["parent_id"] == pid
     assert body["plan"] == [
         {"round_no": 1, "order_in_round": 1, "bolt_no": 3,
-         "ratio": 1.0, "target_torque": 320.0}]
+         "ratio": 1.0, "target_torque": 320.0,
+         "tool_id": "TW-1001", "scheduled_at": None, "angle_deg": 90.0}]
     # 源批次废止
     assert client.get(f"/measurement-batches/{bid}").json()["batch"]["status"] == "superseded"
 
