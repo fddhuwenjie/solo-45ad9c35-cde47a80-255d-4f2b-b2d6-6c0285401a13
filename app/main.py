@@ -20,12 +20,14 @@ from .schemas import (AlignmentCheckCreate, BaselineRequest, CurveAmend, CurveSu
                       PlanRevisionCreate, RemeasurementRequest, RetestRequest,
                       ProcedureCreate, ReviewRequest, SiteConstraintsInput,
                       TensioningAdoptUltrasonic, TensioningPlanCreate,
-                      TensioningRevisionCreate, TensioningRoundReport, TorqueReport)
+                      TensioningRevisionCreate, TensioningRoundReport, ThermalCaseCreate,
+                      ThermalRevisionCreate, TorqueReport)
 from .sequencing import build_plan, sequence_violations
 from .svg import render_svg
 from .tensioning import (build_scheme, channel_results, diff_schemes, evaluate_plan,
                          find_infeasible_rounds as find_infeasible_tension_rounds,
                          flatten_groups, scheme_setpoints, validate_round_report)
+from .thermal import diff_cases, evaluate_case, normalize_case
 from .ultrasonic import GAP_MESSAGES, evaluate_batch, evaluate_reading
 STATUS_LABEL = {
     "draft": "已创建",
@@ -1195,6 +1197,7 @@ def job_package(pid: int, conn: sqlite3.Connection = Depends(get_db)):
         "alignment": alignment,
         "measurement": _measurement_reference(conn, pid),
         "tensioning": _tensioning_reference(conn, pid),
+        "thermal": _thermal_reference(conn, pid),
         "curves": _curve_review(conn, proc),
         "generated_at": utcnow(),
     }
@@ -2243,4 +2246,401 @@ def tensioning_plan_diff(tid: int, conn: sqlite3.Connection = Depends(get_db)):
         "from_revision": prev["revision"], "to_revision": plan["revision"],
         "diff": diff_schemes(prev, prev["scheme_rounds"],
                              plan, plan["scheme_rounds"]),
+    }
+
+
+# ---------------------------------------------------------------- 热态预紧力校核
+
+# 工艺参数已冻结后才能建热态工况（与超声批次/张拉方案一致）
+THERMAL_CREATABLE = ("approved", "in_progress", "completed", "reviewed", "archived")
+THERMAL_ACTIVE = ("open",)
+
+
+def _thermal_payload(data) -> dict:
+    payload = json.loads(data.model_dump_json())
+    # normalize 需要字符串时刻排序（ISO 8601 可字典序），保留原始声明单位
+    return payload
+
+
+def _initial_loads_from_ultrasonic(conn: sqlite3.Connection, batch: dict) -> dict:
+    """已确认超声批次的逐栓有效换算载荷（证据缺口栓不进快照）。"""
+    baselines, readings = _batch_evals(conn, batch)
+    proc = _fetch_proc(conn, batch["procedure_id"])
+    verdict = evaluate_batch({**batch, "bolt_count": proc["bolt_count"]},
+                             baselines, readings)
+    return {str(b["bolt_no"]): b["load_kn"]
+            for b in verdict.bolt_results
+            if not b["gaps"] and b["load_kn"] is not None}
+
+
+def _initial_loads_from_tensioning(conn: sqlite3.Connection, plan: dict) -> dict:
+    """已确认张拉方案评估视图中的逐栓末轮残余预紧力（含采纳超声的实测值）。"""
+    detail = _tension_detail(conn, plan)
+    return {str(b["bolt_no"]): b["residual_load_kn"]
+            for b in detail["evaluation"]["bolt_results"]
+            if b["residual_load_kn"] is not None}
+
+
+def _resolve_thermal_source(conn: sqlite3.Connection, pid: int, source_type: str,
+                            source_id: int | None) -> tuple[int, dict, dict, str | None]:
+    """解析初始载荷来源并冻结逐栓初载快照。
+
+    返回 (source_id, source_row, initial_loads, gate_reason)：
+    来源不存在/跨工艺/未确认时 gate_reason 给出 409 原因；已确认但逐栓初载
+    缺失（证据缺口）不是建案门禁，缺载栓在评估中记 initial_load_missing。
+    """
+    if source_type == "ultrasonic":
+        if source_id is None:
+            row = conn.execute(
+                "SELECT * FROM measurement_batches WHERE procedure_id=?"
+                " AND status='confirmed' ORDER BY id DESC", (pid,)).fetchone()
+            if row is None:
+                return None, None, {}, "no_confirmed_batch"
+            batch = _row_to_batch(row)
+            return batch["id"], batch, _initial_loads_from_ultrasonic(conn, batch), None
+        row = conn.execute("SELECT * FROM measurement_batches WHERE id=?",
+                           (source_id,)).fetchone()
+        if row is None:
+            return None, None, {}, "source_not_found"
+        batch = _row_to_batch(row)
+        if batch["procedure_id"] != pid:
+            return None, None, {}, "source_procedure_mismatch"
+        if batch["status"] != "confirmed":
+            return None, None, {}, "source_not_confirmed"
+        return batch["id"], batch, _initial_loads_from_ultrasonic(conn, batch), None
+
+    if source_id is None:
+        row = conn.execute(
+            "SELECT * FROM tensioning_plans WHERE procedure_id=?"
+            " AND status='confirmed' ORDER BY id DESC", (pid,)).fetchone()
+        if row is None:
+            return None, None, {}, "no_confirmed_plan"
+        plan = _row_to_tension_plan(row)
+        return plan["id"], plan, _initial_loads_from_tensioning(conn, plan), None
+    row = conn.execute("SELECT * FROM tensioning_plans WHERE id=?",
+                       (source_id,)).fetchone()
+    if row is None:
+        return None, None, {}, "source_not_found"
+    plan = _row_to_tension_plan(row)
+    if plan["procedure_id"] != pid:
+        return None, None, {}, "source_procedure_mismatch"
+    if plan["status"] != "confirmed":
+        return None, None, {}, "source_not_confirmed"
+    return plan["id"], plan, _initial_loads_from_tensioning(conn, plan), None
+
+
+def _row_to_thermal_case(row: sqlite3.Row) -> dict:
+    case = dict(row)
+    case["payload"] = json.loads(case["payload"])
+    case["frozen"] = json.loads(case["frozen"])
+    case["initial_loads"] = json.loads(case["initial_loads"])
+    case["result"] = json.loads(case["result"])
+    return case
+
+
+def _fetch_thermal_case(conn: sqlite3.Connection, cid: int) -> dict:
+    row = conn.execute("SELECT * FROM thermal_cases WHERE id=?", (cid,)).fetchone()
+    if row is None:
+        raise HTTPException(404, f"热态工况 {cid} 不存在")
+    return _row_to_thermal_case(row)
+
+
+def _current_thermal_case(conn: sqlite3.Connection, pid: int) -> dict | None:
+    """当前活动修订（最新未废止）；作业包与详情共用同一行。"""
+    row = conn.execute(
+        "SELECT * FROM thermal_cases WHERE procedure_id=? AND status!='superseded'"
+        " ORDER BY revision DESC", (pid,)).fetchone()
+    return _row_to_thermal_case(row) if row else None
+
+
+def _record_thermal_gaps(conn: sqlite3.Connection, case: dict, bolt_count: int) -> None:
+    """评估缺口逐条落 thermal_gaps（栓号 + 时间区间），与结果视图同源。"""
+    for b in case["result"]["bolts"]:
+        for g in b["gaps"]:
+            conn.execute(
+                "INSERT INTO thermal_gaps"
+                " (case_id, revision, bolt_no, reason, message, interval, created_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (case["id"], case["revision"], b["bolt_no"], g["reason"],
+                 g["message"], json.dumps(g["interval"]) if g.get("interval") else None,
+                 utcnow()))
+
+
+def _insert_thermal_case(conn: sqlite3.Connection, pid: int, revision: int,
+                         parent_id: int | None, payload: dict, *,
+                         change_note: str | None) -> dict:
+    proc = _fetch_proc(conn, pid)
+    if len(payload["bolt_zones"]) != proc["bolt_count"]:
+        raise HTTPException(422, detail={
+            "reason": "bolt_zone_count_mismatch",
+            "message": f"bolt_zones 长度 {len(payload['bolt_zones'])} 与螺栓数 "
+                       f"{proc['bolt_count']} 不一致（须按栓号 1..N 逐栓分配分区）",
+        })
+    source_id, source, initial_loads, gate = _resolve_thermal_source(
+        conn, pid, payload["source_type"], payload["source_id"])
+    if gate is not None:
+        labels = {
+            "no_confirmed_batch": "工艺无已确认超声批次，逐栓初始载荷未经确认",
+            "no_confirmed_plan": "工艺无已确认张拉方案，逐栓初始载荷未经确认",
+            "source_not_found": "指定的初始载荷来源不存在",
+            "source_procedure_mismatch": "初始载荷来源不属于本工艺",
+            "source_not_confirmed": "初始载荷来源尚未确认，不能作为热态校核初载",
+        }
+        raise HTTPException(409, detail={
+            "reason": "initial_load_unconfirmed",
+            "message": labels[gate],
+            "source_type": payload["source_type"],
+            "source_id": payload["source_id"],
+        })
+    frozen = normalize_case({**payload, "source_id": source_id})
+    result = evaluate_case(frozen, initial_loads, proc["bolt_count"])
+    cur = conn.execute(
+        """INSERT INTO thermal_cases
+           (procedure_id, revision, parent_id, status, source_type, source_id,
+            payload, frozen, initial_loads, result, change_note, created_at)
+           VALUES (?,?,?,'open',?,?,?,?,?,?,?,?)""",
+        (pid, revision, parent_id, payload["source_type"], source_id,
+         json.dumps(payload), json.dumps(frozen), json.dumps(initial_loads),
+         json.dumps(result), change_note, utcnow()))
+    case = _fetch_thermal_case(conn, cur.lastrowid)
+    _record_thermal_gaps(conn, case, proc["bolt_count"])
+    conn.commit()
+    return _fetch_thermal_case(conn, cur.lastrowid)
+
+
+def _thermal_frozen_view(frozen: dict) -> dict:
+    """冻结参数回显（内部单位 mm/mm²/MPa，附声明单位）。"""
+    def part(p):
+        return {k: p[k] for k in ("name", "length_mm", "area_mm2", "modulus_mpa",
+                                  "cte", "prop_min_c", "prop_max_c", "length_unit",
+                                  "area_unit", "modulus_unit")}
+
+    g = frozen["gasket"]
+    return {
+        "bolt": part(frozen["bolt"]),
+        "members": [part(m) for m in frozen["members"]],
+        "gasket": {
+            "name": g["name"],
+            "effective_area_mm2": g["effective_area_mm2"],
+            "thickness_mm": g["thickness_mm"],
+            "cte": g["cte"],
+            "prop_min_c": g["prop_min_c"],
+            "prop_max_c": g["prop_max_c"],
+            "area_unit": g["area_unit"], "length_unit": g["length_unit"],
+            "compression_rebound_curve": [
+                {"compression_mm": x, "loading_mpa": pc, "rebound_mpa": pr}
+                for x, pc, pr in zip(g["curve"]["compression_mm"],
+                                     g["curve"]["loading_mpa"],
+                                     g["curve"]["rebound_mpa"])],
+        },
+        "bolt_zones": frozen["bolt_zones"],
+        "reference_temperatures_c": frozen["reference"],
+        "limits": frozen["limits"],
+        "max_interval_seconds": frozen["max_interval_seconds"],
+        "temperature_nodes": [{"at": n["at"], "temperatures": n["zones"]}
+                              for n in frozen["nodes"]],
+    }
+
+
+def _thermal_detail(conn: sqlite3.Connection, case: dict) -> dict:
+    """工况详情：冻结参数、逐栓初始载荷、逐时结果、人工决定与缺口（修订查询共用）。"""
+    gaps = [dict(r) for r in conn.execute(
+        "SELECT bolt_no, reason, message, interval FROM thermal_gaps"
+        " WHERE case_id=? ORDER BY id", (case["id"],)).fetchall()]
+    for g in gaps:
+        g["interval"] = json.loads(g["interval"]) if g["interval"] else None
+    return {
+        "case": {
+            "id": case["id"], "procedure_id": case["procedure_id"],
+            "revision": case["revision"], "parent_id": case["parent_id"],
+            "status": case["status"], "source_type": case["source_type"],
+            "source_id": case["source_id"], "change_note": case["change_note"],
+            "decided_by": case["decided_by"], "decision_note": case["decision_note"],
+            "confirmed_at": case["confirmed_at"], "created_at": case["created_at"],
+        },
+        "submitted": case["payload"],
+        "frozen": _thermal_frozen_view(case["frozen"]),
+        "initial_loads_kn": {int(k): v for k, v in case["initial_loads"].items()},
+        "result": case["result"],
+        "gaps": gaps,
+    }
+
+
+def _thermal_reference(conn: sqlite3.Connection, pid: int) -> dict | None:
+    case = _current_thermal_case(conn, pid)
+    return _thermal_detail(conn, case) if case else None
+
+
+@app.post("/procedures/{pid}/thermal-cases", status_code=201)
+def create_thermal_case(pid: int, data: ThermalCaseCreate,
+                        conn: sqlite3.Connection = Depends(get_db)):
+    """建立热态预紧力校核工况：冻结部件/垫片曲线/限值/分区温度时序，逐栓初载
+    只从已确认超声批次或已确认张拉方案读取。
+
+    单位冲突、温度断档、材料/垫片曲线覆盖不足或初载缺失时版本照常落库（201），
+    结果列出栓号与对应区间，但 evaluable/confirmable=false，禁止确认。
+    """
+    proc = _fetch_proc(conn, pid)
+    if proc["status"] not in THERMAL_CREATABLE:
+        raise HTTPException(409, detail={
+            "reason": "not_approvable_for_thermal",
+            "message": f"工艺 {pid} 当前状态 {proc['status']}，须经批准（approved）后才能"
+                       "建立热态工况",
+        })
+    active = _current_thermal_case(conn, pid)
+    if active is not None and active["status"] in THERMAL_ACTIVE:
+        raise HTTPException(409, detail={
+            "reason": "active_thermal_case_exists",
+            "message": f"工艺 {pid} 已有开放热态工况 {active['id']}（修订 "
+                       f"{active['revision']}）；替代边界/曲线须派生修订",
+            "case_id": active["id"],
+        })
+    payload = _thermal_payload(data)
+    row = conn.execute("SELECT MAX(revision) r FROM thermal_cases WHERE procedure_id=?",
+                       (pid,)).fetchone()
+    case = _insert_thermal_case(conn, pid, (row["r"] or 0) + 1, None, payload,
+                                change_note=None)
+    return _thermal_detail(conn, case)
+
+
+@app.get("/procedures/{pid}/thermal-cases")
+def list_thermal_cases(pid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """热态工况修订链（逐版保留，旧修订不覆盖）。"""
+    _fetch_proc(conn, pid)
+    rows = conn.execute(
+        "SELECT id, revision, parent_id, status, source_type, source_id, change_note,"
+        " decided_by, decision_note, confirmed_at, created_at FROM thermal_cases"
+        " WHERE procedure_id=? ORDER BY revision", (pid,)).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        result = json.loads(conn.execute(
+            "SELECT result FROM thermal_cases WHERE id=?", (d["id"],)).fetchone()["result"])
+        d["confirmable"] = result["confirmable"]
+        d["blockers"] = result["blockers"]
+        out.append(d)
+    return {"procedure_id": pid, "thermal_cases": out}
+
+
+@app.get("/thermal-cases/{cid}")
+def get_thermal_case(cid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """工况详情：所选版本的冻结参数、逐时结果与人工决定。"""
+    return _thermal_detail(conn, _fetch_thermal_case(conn, cid))
+
+
+@app.post("/thermal-cases/{cid}/revisions", status_code=201)
+def create_thermal_revision(cid: int, body: ThermalRevisionCreate,
+                            conn: sqlite3.Connection = Depends(get_db)):
+    """人工采用替代边界或材料曲线：必须写明理由，派生修订（旧修订废止不覆盖）。
+
+    仅开放工况可修订；空修订（无任何冻结内容变更）拒绝。
+    """
+    case = _fetch_thermal_case(conn, cid)
+    if case["status"] != "open":
+        raise HTTPException(409, detail={
+            "reason": f"thermal_case_{case['status']}",
+            "message": f"热态工况 {cid} 当前状态 {case['status']}，不能派生修订",
+        })
+    overrides = body.model_dump(exclude_none=True, exclude={"reason"})
+    if not overrides:
+        raise HTTPException(409, detail={
+            "reason": "empty_revision",
+            "message": "空修订：未变更任何冻结参数；替代边界/曲线须给出具体变更"
+                       "（部件、垫片曲线、限值、分区温度时序或初载来源）",
+        })
+    payload = {
+        "source_type": overrides.get("source_type", case["payload"]["source_type"]),
+        "source_id": overrides.get("source_id", case["payload"].get("source_id")),
+        "bolt": overrides.get("bolt", case["payload"]["bolt"]),
+        "members": overrides.get("members", case["payload"]["members"]),
+        "gasket": overrides.get("gasket", case["payload"]["gasket"]),
+        "bolt_zones": overrides.get("bolt_zones", case["payload"]["bolt_zones"]),
+        "reference": overrides.get("reference", case["payload"]["reference"]),
+        "limits": overrides.get("limits", case["payload"]["limits"]),
+        "nodes": overrides.get("nodes", case["payload"]["nodes"]),
+        "notes": overrides.get("notes", case["payload"].get("notes")),
+    }
+    # 新初载来源 / 变更结构需通过与建案相同的 Pydantic 校验
+    try:
+        ThermalCaseCreate(**payload)
+    except ValidationError as exc:
+        raise HTTPException(422, detail=json.loads(exc.json()))
+    new_case = _insert_thermal_case(
+        conn, case["procedure_id"], case["revision"] + 1, cid, payload,
+        change_note=body.reason)
+    conn.execute("UPDATE thermal_cases SET status='superseded' WHERE id=?", (cid,))
+    conn.commit()
+    new_case = _fetch_thermal_case(conn, new_case["id"])
+    return {
+        "thermal_case": _thermal_detail(conn, new_case),
+        "derived_from": cid,
+        "diff": diff_cases(
+            {"frozen": case["frozen"], "source_type": case["source_type"],
+             "source_id": case["source_id"], "initial_loads": case["initial_loads"]},
+            {"frozen": new_case["frozen"], "source_type": new_case["source_type"],
+             "source_id": new_case["source_id"],
+             "initial_loads": new_case["initial_loads"],
+             "change_note": body.reason}),
+    }
+
+
+@app.post("/thermal-cases/{cid}/confirm")
+def confirm_thermal_case(cid: int, body: ReviewRequest | None = None,
+                         conn: sqlite3.Connection = Depends(get_db)):
+    """批准热态校核结果：无证据缺口且无接触分离/压溃/螺栓超载/密封裕量不足。
+
+    不满足则 409 返回 blockers 与逐栓/区间明细，工况保持开放。
+    """
+    case = _fetch_thermal_case(conn, cid)
+    if case["status"] != "open":
+        raise HTTPException(409, detail={
+            "reason": f"thermal_case_{case['status']}",
+            "message": f"热态工况 {cid} 当前状态 {case['status']}，仅开放工况可确认",
+        })
+    result = case["result"]
+    if not result["confirmable"]:
+        raise HTTPException(409, detail={
+            "reason": "thermal_case_not_confirmed",
+            "message": "存在证据缺口或接触分离/压溃/螺栓超载/密封裕量不足，"
+                       "不能确认；采用替代边界或曲线须写明理由派生修订",
+            "blockers": result["blockers"],
+            "gap_reasons": result["gap_reasons"],
+            "violation_reasons": result["violation_reasons"],
+            "bolts": [{"bolt_no": b["bolt_no"],
+                       "first_violation_at": b["first_violation_at"],
+                       "first_violation_reason": b["first_violation_reason"],
+                       "gaps": [{"reason": g["reason"], "interval": g["interval"]}
+                                for g in b["gaps"]]}
+                      for b in result["bolts"]
+                      if b["gaps"] or b["first_violation_reason"]],
+        })
+    conn.execute(
+        "UPDATE thermal_cases SET status='confirmed', confirmed_at=?, decided_by=?,"
+        " decision_note=? WHERE id=?",
+        (utcnow(), body.reviewer if body else None,
+         body.note if body else None, cid))
+    conn.commit()
+    return _thermal_detail(conn, _fetch_thermal_case(conn, cid))
+
+
+@app.get("/thermal-cases/{cid}/diff")
+def thermal_case_diff(cid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """与上一修订的差异：冻结参数、温度时序、初载来源与逐栓初载变化。"""
+    case = _fetch_thermal_case(conn, cid)
+    if case["parent_id"] is None:
+        raise HTTPException(409, detail={
+            "reason": "no_previous_revision",
+            "message": f"热态工况修订 {case['revision']} 为首版，无历史修订可对比",
+        })
+    prev = _fetch_thermal_case(conn, case["parent_id"])
+    return {
+        "procedure_id": case["procedure_id"],
+        "from_case_id": prev["id"], "to_case_id": cid,
+        "from_revision": prev["revision"], "to_revision": case["revision"],
+        "diff": diff_cases(
+            {"frozen": prev["frozen"], "source_type": prev["source_type"],
+             "source_id": prev["source_id"], "initial_loads": prev["initial_loads"]},
+            {"frozen": case["frozen"], "source_type": case["source_type"],
+             "source_id": case["source_id"], "initial_loads": case["initial_loads"],
+             "change_note": case["change_note"]}),
     }

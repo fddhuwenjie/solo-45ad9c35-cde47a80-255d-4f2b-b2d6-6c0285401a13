@@ -406,6 +406,199 @@ class TensioningAdoptUltrasonic(BaseModel):
         None, description="超声测量批次 id；缺省取本工艺最新已确认批次")
 
 
+# ---------------------------------------------------------------- 热态预紧力校核
+
+ThermalLengthUnit = Literal["mm", "cm", "m", "in"]
+ThermalAreaUnit = Literal["mm2", "cm2", "m2", "in2"]
+ModulusUnit = Literal["MPa", "GPa", "Pa"]
+PressureUnit = Literal["MPa", "GPa", "Pa", "psi", "ksi"]
+ThermalSourceType = Literal["ultrasonic", "tensioning"]
+
+
+class ThermalPartInput(BaseModel):
+    """热态结构部件（螺栓或一片夹持件）的冻结几何与材料物性。"""
+
+    name: str = Field(..., min_length=1, description="部件名称（夹持件用于留痕区分）")
+    length: float = Field(..., gt=0, description="有效长度（声明单位）")
+    length_unit: ThermalLengthUnit = Field("mm", description="长度单位")
+    area: float = Field(..., gt=0, description="截面积（声明单位）")
+    area_unit: ThermalAreaUnit = Field("mm2", description="截面积单位")
+    elastic_modulus: float = Field(..., gt=0, description="弹性模量（声明单位）")
+    modulus_unit: ModulusUnit = Field("MPa", description="弹性模量单位")
+    cte: float = Field(..., gt=0, description="热膨胀系数（1/℃）")
+    prop_min_c: float = Field(..., description="材料物性曲线适用温度下限（℃）")
+    prop_max_c: float = Field(..., description="材料物性曲线适用温度上限（℃）")
+
+    @model_validator(mode="after")
+    def _check_prop_range(self) -> "ThermalPartInput":
+        if self.prop_max_c <= self.prop_min_c:
+            raise ValueError("材料物性适用温度上限须大于下限")
+        return self
+
+
+class GasketCurvePoint(BaseModel):
+    """垫片压缩-回弹曲线折点：压缩量及该点加载/回弹压力（两折点共用压缩坐标）。"""
+
+    compression: float = Field(..., ge=0, description="垫片压缩量（声明单位）")
+    compression_unit: ThermalLengthUnit = Field("mm", description="压缩量单位")
+    loading_pressure: float = Field(..., ge=0, description="加载支压力（声明单位）")
+    rebound_pressure: float = Field(..., ge=0, description="回弹支压力（声明单位，≤加载支）")
+    pressure_unit: PressureUnit = Field("MPa", description="压力单位")
+
+    @model_validator(mode="after")
+    def _check_branches(self) -> "GasketCurvePoint":
+        if self.rebound_pressure > self.loading_pressure:
+            raise ValueError("同一压缩量的回弹压力不得高于加载压力（滞回耗能）")
+        return self
+
+
+class ThermalGasketInput(BaseModel):
+    """垫片冻结参数：有效承压面积、厚度、热膨胀系数、物性温度区间与压缩-回弹曲线。"""
+
+    name: str | None = Field(None, min_length=1, description="垫片型号/材质")
+    effective_area: float = Field(..., gt=0, description="垫片有效承压面积（声明单位）")
+    area_unit: ThermalAreaUnit = Field("mm2", description="面积单位")
+    thickness: float = Field(..., gt=0, description="垫片自由厚度（声明单位）")
+    length_unit: ThermalLengthUnit = Field("mm", description="厚度单位")
+    cte: float = Field(..., ge=0, description="垫片热膨胀系数（1/℃）")
+    prop_min_c: float = Field(..., description="垫片物性/曲线适用温度下限（℃）")
+    prop_max_c: float = Field(..., description="垫片物性/曲线适用温度上限（℃）")
+    points: list[GasketCurvePoint] = Field(
+        ..., min_length=2, description="压缩-回弹曲线折点（按压缩量升序）")
+
+    @model_validator(mode="after")
+    def _check_curve(self) -> "ThermalGasketInput":
+        if self.prop_max_c <= self.prop_min_c:
+            raise ValueError("垫片物性适用温度上限须大于下限")
+        ordered = sorted(self.points, key=lambda p: p.compression)
+        if [p.compression for p in ordered] != [p.compression for p in self.points]:
+            raise ValueError("压缩-回弹曲线折点须按压缩量升序提交")
+        if len({p.compression for p in ordered}) != len(ordered):
+            raise ValueError("压缩-回弹曲线压缩量不得重复")
+        for field in ("loading_pressure", "rebound_pressure"):
+            vals = [getattr(p, field) for p in ordered]
+            if any(b < a - 1e-12 for a, b in zip(vals, vals[1:])):
+                raise ValueError(f"曲线{field}须随压缩量单调不减")
+        if ordered[0].compression != 0 or ordered[0].loading_pressure != 0:
+            raise ValueError("曲线首折点须为零压缩零压力（自由状态原点）")
+        if ordered[-1].loading_pressure <= 0:
+            raise ValueError("曲线末折点加载压力须为正")
+        return self
+
+
+class ThermalReferenceTemps(BaseModel):
+    """装配（初始载荷确认）参考温度：螺栓/夹持件/垫片各自的基准温度。"""
+
+    bolt_temp_c: float = Field(..., description="螺栓参考温度（℃）")
+    member_temp_c: float = Field(..., description="夹持件参考温度（℃）")
+    gasket_temp_c: float = Field(..., description="垫片参考温度（℃）")
+
+
+class ThermalLimits(BaseModel):
+    """热态校核冻结限值（单位固定：载荷 kN、面压 MPa、时间 s）。"""
+
+    bolt_load_limit_kn: float = Field(..., gt=0, description="螺栓允许载荷上限（kN）")
+    min_seating_pressure_mpa: float = Field(..., gt=0,
+                                            description="最小密封（压紧）面压（MPa）")
+    max_gasket_pressure_mpa: float = Field(..., gt=0, description="垫片压溃面压上限（MPa）")
+    max_temperature_interval_seconds: float = Field(
+        ..., gt=0, description="相邻温度节点最大允许间隔（s），超出即温度断档")
+
+    @model_validator(mode="after")
+    def _check_limits(self) -> "ThermalLimits":
+        if self.max_gasket_pressure_mpa <= self.min_seating_pressure_mpa:
+            raise ValueError("垫片压溃面压上限须高于最小密封面压")
+        return self
+
+
+class ThermalZoneReading(BaseModel):
+    """某温度节点上单个分区的三部件温度（℃）。"""
+
+    zone: str = Field(..., min_length=1, description="分区名（与螺栓分配一致）")
+    bolt_temp_c: float
+    member_temp_c: float
+    gasket_temp_c: float
+
+
+class ThermalNode(BaseModel):
+    """带时标的分区温度节点：时刻 + 各分区螺栓/夹持件/垫片温度。"""
+
+    at: datetime = Field(..., description="温度节点时刻 ISO 8601")
+    temperatures: list[ThermalZoneReading] = Field(
+        ..., min_length=1, description="本时刻各分区温度（分区不得重复）")
+
+    @field_validator("temperatures")
+    @classmethod
+    def _check_unique_zones(cls, v: list[ThermalZoneReading]) -> list[ThermalZoneReading]:
+        zones = [z.zone for z in v]
+        if len(zones) != len(set(zones)):
+            raise ValueError("同一温度节点内分区不得重复")
+        return v
+
+
+class ThermalCaseCreate(BaseModel):
+    """热态预紧力校核建案：冻结结构/垫片/限值/时序，逐栓初载取自已确认来源。
+
+    初始载荷只从已确认超声批次或已确认液压张拉方案读取（建案时冻结快照）；
+    bolt_zones 按栓号顺序（长度 = 螺栓数）给出每栓所属温度分区。
+    单位冲突、温度断档、材料/垫片曲线覆盖不足等作为证据缺口记录，
+    版本照常落库但不可确认。
+    """
+
+    source_type: ThermalSourceType = Field(
+        ..., description="逐栓初始载荷来源：ultrasonic 已确认超声批次 / tensioning 已确认张拉方案")
+    source_id: int | None = Field(
+        None, ge=1, description="来源 id；缺省取本工艺最新已确认来源")
+    bolt: ThermalPartInput = Field(..., description="螺栓长度/截面/E/热膨胀系数/物性区间")
+    members: list[ThermalPartInput] = Field(
+        ..., min_length=1, description="夹持件叠层（两片法兰及各层，按载荷传递方向）")
+    gasket: ThermalGasketInput = Field(..., description="垫片有效面积/厚度/曲线与物性区间")
+    bolt_zones: list[str] = Field(
+        ..., min_length=1, description="逐栓温度分区（按栓号 1..N 顺序）")
+    reference: ThermalReferenceTemps = Field(..., description="装配参考温度")
+    limits: ThermalLimits = Field(..., description="螺栓/垫片/温度断档冻结限值")
+    nodes: list[ThermalNode] = Field(
+        ..., min_length=1, description="带时标的分区温度节点（须时刻升序）")
+    notes: str | None = Field(None, description="建案说明")
+
+    @field_validator("nodes")
+    @classmethod
+    def _check_node_order(cls, v: list[ThermalNode]) -> list[ThermalNode]:
+        ats = [n.at for n in v]
+        if len(ats) != len(set(ats)):
+            raise ValueError("温度节点时刻不得重复")
+        if ats != sorted(ats):
+            raise ValueError("温度节点须按时刻升序提交")
+        return v
+
+    @model_validator(mode="after")
+    def _check_zone_consistency(self) -> "ThermalCaseCreate":
+        assigned = set(self.bolt_zones)
+        for n in self.nodes:
+            present = {z.zone for z in n.temperatures}
+            missing = sorted(assigned - present)
+            if missing:
+                raise ValueError(
+                    f"温度节点 {n.at.isoformat()} 缺螺栓分配到的分区 {missing}")
+        return self
+
+
+class ThermalRevisionCreate(BaseModel):
+    """人工采用替代边界或材料曲线派生修订：必须写明理由，至少变更一项冻结内容。"""
+
+    reason: str = Field(..., min_length=1, description="采用替代边界/曲线的理由（写入修订链）")
+    source_type: ThermalSourceType | None = Field(None, description="更换初始载荷来源类型")
+    source_id: int | None = Field(None, ge=1, description="更换初始载荷来源 id")
+    bolt: ThermalPartInput | None = None
+    members: list[ThermalPartInput] | None = Field(None, min_length=1)
+    gasket: ThermalGasketInput | None = None
+    bolt_zones: list[str] | None = Field(None, min_length=1)
+    reference: ThermalReferenceTemps | None = None
+    limits: ThermalLimits | None = None
+    nodes: list[ThermalNode] | None = Field(None, min_length=1)
+    notes: str | None = None
+
+
 # ---------------------------------------------------------------- 装配对中预检
 
 LengthUnit = Literal["mm", "cm", "m", "in"]
