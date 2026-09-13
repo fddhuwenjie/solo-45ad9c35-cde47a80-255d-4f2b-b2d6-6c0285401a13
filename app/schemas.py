@@ -642,3 +642,163 @@ class AlignmentCheckCreate(BaseModel):
             raise ValueError("法兰内孔直径不得大于法兰面直径")
         # 方位重复、几何自相矛盾不作为请求级拒绝：版本照常冻结并在结论中只列证据缺口
         return self
+
+
+# ---------------------------------------------------------------- 紧固件摩擦批次标定
+
+LubricantState = Literal["new_opened", "in_use"]
+LoadUnit = Literal["kN", "N", "lbf"]
+
+
+class FastenerStateInput(BaseModel):
+    """紧固件与润滑剂批次状态五元组（工艺登记与标定冻结共用，一致性按等值判定）。
+
+    同一套工艺改用镀层螺栓、另一批螺母或新开封润滑剂后，旧扭矩系数未必仍
+    适用：批次状态变化须重新登记，相关草稿标定转入待复核。
+    """
+
+    bolt_batch: str = Field(..., min_length=1, description="螺栓批次号")
+    nut_batch: str = Field(..., min_length=1, description="螺母批次号")
+    surface_treatment: str = Field(..., min_length=1,
+                                   description="表面处理（如 镀锌/磷化/达克罗）")
+    lubricant_batch: str = Field(..., min_length=1, description="润滑剂批次号")
+    lubricant_state: LubricantState = Field(
+        ..., description="润滑状态：new_opened 新开封 / in_use 已开封在用")
+
+
+class CalibrationChannelInput(BaseModel):
+    """测量通道（扭矩或载荷传感器）：编号、量程与校准有效期。"""
+
+    channel_id: str = Field(..., min_length=1, description="通道/传感器编号")
+    range_min: float = Field(..., ge=0, description="量程下限（提交单位）")
+    range_max: float = Field(..., gt=0, description="量程上限（提交单位）")
+    calibration_valid_until: date = Field(..., description="校准有效期（含当日）")
+
+    @model_validator(mode="after")
+    def _check_range(self) -> "CalibrationChannelInput":
+        if self.range_max <= self.range_min:
+            raise ValueError("通道量程上限须大于下限")
+        return self
+
+
+class CalibrationPoint(BaseModel):
+    """单个标定采样点：扭矩、转角、轴向载荷（单位由建版级字段声明）。"""
+
+    torque: float = Field(..., ge=0, description="扭矩读数（torque_unit 单位）")
+    angle: float = Field(..., ge=0, description="转角读数（angle_unit 单位）")
+    load: float = Field(..., ge=0, description="轴向载荷读数（load_unit 单位）")
+
+
+class CalibrationAssembly(BaseModel):
+    """一次装配（试样第 N 次拧紧）的逐点曲线与测量时刻。"""
+
+    assembly_index: int = Field(..., ge=1, description="装配次序号（自 1 递增）")
+    measured_at: datetime = Field(..., description="本次装配测量时刻 ISO 8601")
+    points: list[CalibrationPoint] = Field(..., min_length=2, description="逐点采样序列")
+    excluded: bool = Field(False, description="本次装配是否被剔除（须注明理由）")
+    exclusion_reason: str | None = Field(None, description="剔除理由；剔除无理由即草稿阻断项")
+
+
+class CalibrationSpecimen(BaseModel):
+    """一个试样：批次归属、声明几何与逐次装配曲线。"""
+
+    specimen_no: str = Field(..., min_length=1, description="试样编号")
+    bolt_batch: str = Field(..., min_length=1, description="试样螺栓批次")
+    nut_batch: str = Field(..., min_length=1, description="试样螺母批次")
+    lubricant_batch: str = Field(..., min_length=1, description="试样润滑剂批次")
+    diameter_mm: float = Field(..., gt=0, description="试样声明公称直径（mm）")
+    excluded: bool = Field(False, description="整只试样是否被剔除（须注明理由）")
+    exclusion_reason: str | None = Field(None, description="剔除理由；剔除无理由即草稿阻断项")
+    assemblies: list[CalibrationAssembly] = Field(
+        ..., min_length=1, description="逐次装配曲线（装配次序号不得重复）")
+
+    @field_validator("assemblies")
+    @classmethod
+    def _check_unique_assembly(cls, v: list[CalibrationAssembly]) -> list[CalibrationAssembly]:
+        idxs = [a.assembly_index for a in v]
+        if len(idxs) != len(set(idxs)):
+            raise ValueError("同一试样的装配次序号不得重复")
+        return v
+
+
+class FrictionCalibrationCreate(BaseModel):
+    """摩擦批次标定建版：冻结批次身份/试样几何/装配次数/测量通道与逐点曲线。
+
+    逐点读数单位由 torque_unit/load_unit/angle_unit 声明（全版统一）；目标载荷、
+    贴合阈值与通道量程同单位。评估只取贴合后的单调加载段；存在草稿阻断项时
+    版本照常落库但不可确认。
+    """
+
+    identity: FastenerStateInput = Field(..., description="批次身份五元组（冻结）")
+    nominal_diameter_mm: float = Field(..., gt=0, description="试样公称直径 d（mm）")
+    min_specimens: int = Field(3, ge=2, description="合格试样数量下限")
+    assemblies_per_specimen: int = Field(1, ge=1, description="每试样要求装配次数")
+    target_load: float = Field(..., gt=0, description="目标载荷点（load_unit 单位）")
+    load_tolerance_pct: float = Field(..., gt=0, le=50, description="目标载荷带 ±%")
+    snug_torque: float = Field(..., gt=0, description="贴合扭矩阈值（torque_unit 单位）")
+    torque_channel: CalibrationChannelInput = Field(..., description="扭矩测量通道")
+    load_channel: CalibrationChannelInput = Field(..., description="轴向载荷测量通道")
+    torque_unit: TorqueUnit = Field("Nm", description="扭矩单位")
+    load_unit: LoadUnit = Field("kN", description="轴向载荷单位")
+    angle_unit: AngleUnit = Field("deg", description="转角单位")
+    specimens: list[CalibrationSpecimen] = Field(..., min_length=1, description="试样清单")
+    seating_overrides: dict[str, int] = Field(
+        default_factory=dict,
+        description="人工贴合点 {'试样编号#装配次': 点索引}；人工改动须走修订")
+
+    @field_validator("specimens")
+    @classmethod
+    def _check_unique_specimens(cls, v: list[CalibrationSpecimen]) -> list[CalibrationSpecimen]:
+        nos = [s.specimen_no for s in v]
+        if len(nos) != len(set(nos)):
+            raise ValueError("试样编号不得重复")
+        return v
+
+
+class CalibrationExclusionInput(BaseModel):
+    """剔除一个试样或一次装配：必须注明理由（人工决定，生成修订）。"""
+
+    specimen_no: str = Field(..., min_length=1, description="试样编号")
+    assembly_index: int | None = Field(
+        None, ge=1, description="装配次序号；缺省剔除整只试样")
+    reason: str = Field(..., min_length=1, description="剔除理由（留痕）")
+
+
+class CalibrationIncludeInput(BaseModel):
+    """撤销剔除，恢复一个试样或一次装配参与统计。"""
+
+    specimen_no: str = Field(..., min_length=1, description="试样编号")
+    assembly_index: int | None = Field(
+        None, ge=1, description="装配次序号；缺省恢复整只试样")
+
+
+class CalibrationRevisionCreate(BaseModel):
+    """标定修订：人工改贴合点、剔除/恢复试样或更换试样数据，必须说明理由。
+
+    仅填写需要变更的字段；空修订（无任何变更）将被拒绝。批次身份与冻结
+    几何/通道/目标载荷不可经修订改变（批次变化须另建标定）。
+    """
+
+    reason: str = Field(..., min_length=1, description="修订理由（写入版本链）")
+    specimens: list[CalibrationSpecimen] | None = Field(
+        None, min_length=1, description="整体替换试样数据；缺省沿用")
+    seating_overrides: dict[str, int | None] | None = Field(
+        None, description="人工贴合点变更 {'试样编号#装配次': 点索引}；值为 null 撤销该覆盖")
+    exclude: list[CalibrationExclusionInput] | None = Field(
+        None, description="剔除试样/装配次（逐项注明理由）")
+    include: list[CalibrationIncludeInput] | None = Field(
+        None, description="恢复被剔除的试样/装配次")
+
+
+class ApproveRequest(BaseModel):
+    """工艺批准可选引用已确认标定版：批次身份须与当前批次状态一致。"""
+
+    calibration_id: int | None = Field(
+        None, ge=1, description="引用的摩擦标定版本 id；缺省不引用")
+
+
+class CalibrationReinstateRequest(BaseModel):
+    """批次变化待复核的草稿标定，人工复核后恢复为草稿（决定留痕）。"""
+
+    reviewer: str = Field(..., min_length=1, description="复核人")
+    note: str = Field(..., min_length=1, description="复核结论（恢复理由）")

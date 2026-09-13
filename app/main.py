@@ -10,18 +10,23 @@ from fastapi import Depends, FastAPI, HTTPException, Response
 from pydantic import ValidationError
 
 from .alignment import analyze_alignment, diff_analyses
+from .calibration import (diff_calibrations, evaluate_calibration,
+                          normalize_frozen)
 from .curve import analyze_curve, evaluate_curve_review
 from .db import get_conn, init_db, utcnow
 from .planning import (PlanInfeasible, default_min_separation, expand_angles,
                        schedule_plan)
 from .rules import find_infeasible_rounds, validate_report
-from .schemas import (AlignmentCheckCreate, BaselineRequest, CurveAmend, CurveSubmit,
-                      DeriveRequest, ExcludeRequest, MeasurementBatchCreate,
-                      PlanRevisionCreate, RemeasurementRequest, RetestRequest,
-                      ProcedureCreate, ReviewRequest, SiteConstraintsInput,
+from .schemas import (AlignmentCheckCreate, ApproveRequest, BaselineRequest,
+                      CalibrationRevisionCreate, CalibrationReinstateRequest,
+                      CurveAmend, CurveSubmit, DeriveRequest, ExcludeRequest,
+                      FastenerStateInput, FrictionCalibrationCreate,
+                      MeasurementBatchCreate, PlanRevisionCreate,
+                      RemeasurementRequest, RetestRequest, ProcedureCreate,
+                      ReviewRequest, SiteConstraintsInput,
                       TensioningAdoptUltrasonic, TensioningPlanCreate,
-                      TensioningRevisionCreate, TensioningRoundReport, ThermalCaseCreate,
-                      ThermalRevisionCreate, TorqueReport)
+                      TensioningRevisionCreate, TensioningRoundReport,
+                      ThermalCaseCreate, ThermalRevisionCreate, TorqueReport)
 from .sequencing import build_plan, sequence_violations
 from .svg import render_svg
 from .tensioning import (build_scheme, channel_results, diff_schemes, evaluate_plan,
@@ -506,14 +511,24 @@ def update_draft(pid: int, data: ProcedureCreate, conn: sqlite3.Connection = Dep
 
 
 @app.post("/procedures/{pid}/approve")
-def approve(pid: int, conn: sqlite3.Connection = Depends(get_db)):
-    """批准：锁定全部参数并冻结施工计划；批准前校验序列可实现性与每轮可行区间。"""
+def approve(pid: int, body: ApproveRequest | None = None,
+            conn: sqlite3.Connection = Depends(get_db)):
+    """批准：锁定全部参数并冻结施工计划；批准前校验序列可实现性与每轮可行区间。
+
+    可选引用已确认摩擦标定版（body.calibration_id）：批次身份（紧固件批次、
+    表面处理与润滑状态）须与工艺当前批次状态一致，引用随批准冻结。
+    """
     proc = _fetch_proc(conn, pid)
     if proc["status"] != "draft":
         raise HTTPException(409, f"工艺 {pid} 当前状态 {proc['status']}，须为 draft 才能批准")
     _preflight(conn, proc)
     _freeze_plan(conn, proc)  # 登记现场约束时规划器无解即 409 plan_infeasible
-    return {"procedure": _transition(conn, pid, "draft", "approved", "approved_at")}
+    extra, params = "", ()
+    if body is not None and body.calibration_id is not None:
+        _calibration_adoption_gate(conn, proc, body.calibration_id)
+        extra, params = ", adopted_calibration_id=?", (body.calibration_id,)
+    return {"procedure": _transition(conn, pid, "draft", "approved", "approved_at",
+                                     extra=extra, params=params)}
 
 
 @app.post("/procedures/{pid}/start")
@@ -1198,6 +1213,8 @@ def job_package(pid: int, conn: sqlite3.Connection = Depends(get_db)):
         "measurement": _measurement_reference(conn, pid),
         "tensioning": _tensioning_reference(conn, pid),
         "thermal": _thermal_reference(conn, pid),
+        "fastener_state": _current_fastener_state(conn, pid),
+        "friction_calibration": _calibration_reference(conn, proc),
         "curves": _curve_review(conn, proc),
         "generated_at": utcnow(),
     }
@@ -2644,4 +2661,479 @@ def thermal_case_diff(cid: int, conn: sqlite3.Connection = Depends(get_db)):
             {"frozen": case["frozen"], "source_type": case["source_type"],
              "source_id": case["source_id"], "initial_loads": case["initial_loads"],
              "change_note": case["change_note"]}),
+    }
+
+
+# ---------------------------------------------------------------- 紧固件摩擦批次标定
+
+# 允许建立标定的工艺状态（标定指导目标扭矩设定，须在开工前完成）
+CALIBRATION_CREATABLE = ("draft", "approved")
+
+
+def _current_fastener_state(conn: sqlite3.Connection, pid: int) -> dict | None:
+    """工艺当前批次状态（最新登记版）；未登记为 None。"""
+    row = conn.execute(
+        "SELECT * FROM fastener_states WHERE procedure_id=? ORDER BY revision DESC",
+        (pid,)).fetchone()
+    if row is None:
+        return None
+    return {"revision": row["revision"], "state": json.loads(row["payload"]),
+            "created_at": row["created_at"]}
+
+
+def _row_to_calibration(row: sqlite3.Row) -> dict:
+    c = dict(row)
+    c["identity"] = json.loads(c.pop("identity_key"))
+    c["payload"] = json.loads(c["payload"])
+    c["frozen"] = json.loads(c["frozen"])
+    c["analysis"] = json.loads(c["analysis"])
+    return c
+
+
+def _fetch_calibration(conn: sqlite3.Connection, cid: int) -> dict:
+    row = conn.execute(
+        "SELECT * FROM friction_calibrations WHERE id=?", (cid,)).fetchone()
+    if row is None:
+        raise HTTPException(404, f"摩擦标定 {cid} 不存在")
+    return _row_to_calibration(row)
+
+
+def _calibration_summary(c: dict) -> dict:
+    return {"calibration_id": c["id"], "procedure_id": c["procedure_id"],
+            "revision": c["revision"], "parent_id": c["parent_id"],
+            "status": c["status"], "identity": c["identity"],
+            "confirmable": c["analysis"]["confirmable"],
+            "blockers": c["analysis"]["blockers"],
+            "recommended_torque": c["analysis"]["recommended_torque"],
+            "change_note": c["change_note"], "decided_by": c["decided_by"],
+            "decision_note": c["decision_note"],
+            "confirmed_at": c["confirmed_at"], "created_at": c["created_at"]}
+
+
+def _calibration_detail(c: dict) -> dict:
+    """标定详情：冻结参数、原始点、拟合参数与人工决定（版本查询/标定包共用）。"""
+    return {**_calibration_summary(c),
+            "frozen": c["frozen"],
+            "specimens": c["payload"]["specimens"],
+            "seating_overrides": c["payload"].get("seating_overrides") or {},
+            "analysis": c["analysis"]}
+
+
+def _calibration_reference(conn: sqlite3.Connection, proc: dict) -> dict | None:
+    """作业包引用的标定版：批准引用的已确认版优先，否则当前最新未废止版。"""
+    cid = proc.get("adopted_calibration_id")
+    if cid is not None:
+        row = conn.execute(
+            "SELECT * FROM friction_calibrations WHERE id=?", (cid,)).fetchone()
+        if row is not None:
+            return {**_calibration_detail(_row_to_calibration(row)), "adopted": True}
+    row = conn.execute(
+        "SELECT * FROM friction_calibrations WHERE procedure_id=?"
+        " AND status!='superseded' ORDER BY revision DESC", (proc["id"],)).fetchone()
+    if row is None:
+        return None
+    return {**_calibration_detail(_row_to_calibration(row)), "adopted": False}
+
+
+def _calibration_adoption_gate(conn: sqlite3.Connection, proc: dict, cid: int) -> None:
+    """批准引用门禁：标定版须已确认，且批次身份与工艺当前批次状态一致。"""
+    cal = _fetch_calibration(conn, cid)
+    if cal["procedure_id"] != proc["id"]:
+        raise HTTPException(409, detail={
+            "reason": "calibration_procedure_mismatch",
+            "message": f"摩擦标定 {cid} 属于工艺 {cal['procedure_id']}，"
+                       f"不能引用到工艺 {proc['id']}",
+        })
+    if cal["status"] != "confirmed":
+        raise HTTPException(409, detail={
+            "reason": "calibration_not_confirmed",
+            "message": f"摩擦标定 {cid} 当前状态 {cal['status']}，"
+                       "工艺批准只能引用已确认（confirmed）的标定版",
+            "calibration_status": cal["status"],
+            "blockers": cal["analysis"]["blockers"],
+        })
+    state = _current_fastener_state(conn, proc["id"])
+    if state is None:
+        raise HTTPException(409, detail={
+            "reason": "fastener_state_missing",
+            "message": f"工艺 {proc['id']} 尚未登记当前紧固件批次状态，无法核对标定"
+                       "一致性；请先 PUT /procedures/{id}/fastener-state 登记",
+        })
+    if state["state"] != cal["identity"]:
+        raise HTTPException(409, detail={
+            "reason": "calibration_state_mismatch",
+            "message": "标定批次身份与工艺当前批次状态不一致（紧固件批次、表面处理"
+                       "或润滑状态不同），旧扭矩系数不适用；须以当前批次重新标定",
+            "calibration_identity": cal["identity"],
+            "fastener_state": state["state"],
+        })
+
+
+def _check_seating_overrides(payload: dict) -> None:
+    """人工贴合点键须指向存在的 试样#装配次，索引须在点数范围内。"""
+    overrides = payload.get("seating_overrides") or {}
+    assemblies = {f"{s['specimen_no']}#{a['assembly_index']}": len(a["points"])
+                  for s in payload["specimens"] for a in s["assemblies"]}
+    for key, idx in overrides.items():
+        if key not in assemblies:
+            raise HTTPException(422, detail={
+                "reason": "unknown_seating_override",
+                "message": f"人工贴合点 {key!r} 不对应任何已提交装配次",
+                "valid_keys": sorted(assemblies),
+            })
+        if not (0 <= idx < assemblies[key]):
+            raise HTTPException(422, detail={
+                "reason": "seating_index_out_of_range",
+                "message": f"人工贴合点 {key} 索引 {idx} 超出该装配次点数 "
+                           f"{assemblies[key]}",
+            })
+
+
+def _calibration_status_for(identity: dict, state: dict | None) -> str:
+    """批次身份与当前批次状态不一致的草稿标定转入待复核。"""
+    if state is not None and state["state"] != identity:
+        return "pending_review"
+    return "draft"
+
+
+def _insert_calibration(conn: sqlite3.Connection, pid: int, revision: int,
+                        parent_id: int | None, payload: dict, frozen: dict,
+                        analysis: dict, *, status: str,
+                        change_note: str | None) -> int:
+    cur = conn.execute(
+        """INSERT INTO friction_calibrations
+           (procedure_id, revision, parent_id, status, identity_key, payload,
+            frozen, analysis, change_note, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (pid, revision, parent_id, status, json.dumps(frozen["identity"]),
+         json.dumps(payload), json.dumps(frozen), json.dumps(analysis),
+         change_note, utcnow()))
+    return cur.lastrowid
+
+
+@app.put("/procedures/{pid}/fastener-state")
+def put_fastener_state(pid: int, body: FastenerStateInput,
+                       conn: sqlite3.Connection = Depends(get_db)):
+    """登记/更新工艺当前紧固件批次状态（草稿可改，整组另存新版本）。
+
+    批次变化仅让相关草稿标定待复核：批次身份与新状态不一致的 draft 标定
+    转入 pending_review（不可确认、不可被批准引用），已确认标定版不受影响。
+    """
+    proc = _fetch_proc(conn, pid)
+    if proc["status"] != "draft":
+        raise HTTPException(409, detail={
+            "reason": "fastener_state_locked",
+            "message": f"工艺 {pid} 当前状态 {proc['status']}：批次状态已随批准冻结；"
+                       "批次变化须派生新工艺版本并重新标定",
+        })
+    state = json.loads(body.model_dump_json())
+    current = _current_fastener_state(conn, pid)
+    revision = (current["revision"] + 1) if current else 1
+    conn.execute(
+        "INSERT INTO fastener_states (procedure_id, revision, payload, created_at)"
+        " VALUES (?,?,?,?)", (pid, revision, json.dumps(state), utcnow()))
+    affected: list[int] = []
+    if current is None or current["state"] != state:
+        rows = conn.execute(
+            "SELECT id, identity_key FROM friction_calibrations"
+            " WHERE procedure_id=? AND status='draft'", (pid,)).fetchall()
+        for r in rows:
+            if json.loads(r["identity_key"]) != state:
+                conn.execute(
+                    "UPDATE friction_calibrations SET status='pending_review'"
+                    " WHERE id=?", (r["id"],))
+                affected.append(r["id"])
+    conn.commit()
+    return {"procedure_id": pid, "revision": revision, "state": state,
+            "pending_review_calibrations": affected,
+            "message": ("批次状态已登记；批次身份不一致的草稿标定已转入待复核"
+                        if affected else "批次状态已登记")}
+
+
+@app.get("/procedures/{pid}/fastener-state")
+def get_fastener_state(pid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """工艺当前批次状态（最新登记版）与待复核标定清单。"""
+    _fetch_proc(conn, pid)
+    current = _current_fastener_state(conn, pid)
+    rows = conn.execute(
+        "SELECT id, revision FROM friction_calibrations"
+        " WHERE procedure_id=? AND status='pending_review' ORDER BY revision",
+        (pid,)).fetchall()
+    return {"procedure_id": pid,
+            "revision": current["revision"] if current else None,
+            "state": current["state"] if current else None,
+            "pending_review_calibrations": [dict(r) for r in rows]}
+
+
+@app.post("/procedures/{pid}/friction-calibrations", status_code=201)
+def create_friction_calibration(pid: int, data: FrictionCalibrationCreate,
+                                conn: sqlite3.Connection = Depends(get_db)):
+    """建立摩擦批次标定：冻结批次身份/试样几何/装配次数/测量通道与逐点曲线。
+
+    版本照常落库（201）；存在草稿阻断项（试样或批次覆盖不足、通道校准失效、
+    曲线回退、几何不一致、剔除无理由、窗口越量程）时 confirmable=false，
+    标定停在草稿。
+    """
+    proc = _fetch_proc(conn, pid)
+    if proc["status"] not in CALIBRATION_CREATABLE:
+        raise HTTPException(409, detail={
+            "reason": "calibration_window_closed",
+            "message": f"工艺 {pid} 当前状态 {proc['status']}：标定仅在 draft/approved "
+                       "阶段建立（标定指导目标扭矩设定，须在开工前完成）",
+        })
+    payload = json.loads(data.model_dump_json())
+    _check_seating_overrides(payload)
+    frozen = normalize_frozen(payload, tool_range_min_nm=proc["tool_range_min"],
+                              tool_range_max_nm=proc["tool_range_max"])
+    analysis = evaluate_calibration(frozen, payload)
+    state = _current_fastener_state(conn, pid)
+    status = _calibration_status_for(frozen["identity"], state)
+    row = conn.execute(
+        "SELECT MAX(revision) r FROM friction_calibrations WHERE procedure_id=?",
+        (pid,)).fetchone()
+    cid = _insert_calibration(conn, pid, (row["r"] or 0) + 1, None, payload,
+                              frozen, analysis, status=status, change_note=None)
+    conn.commit()
+    return _calibration_detail(_fetch_calibration(conn, cid))
+
+
+@app.get("/procedures/{pid}/friction-calibrations")
+def list_friction_calibrations(pid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """标定修订链（逐版保留，旧修订不覆盖）。"""
+    _fetch_proc(conn, pid)
+    rows = conn.execute(
+        "SELECT * FROM friction_calibrations WHERE procedure_id=? ORDER BY revision",
+        (pid,)).fetchall()
+    return {"procedure_id": pid,
+            "friction_calibrations": [_calibration_summary(_row_to_calibration(r))
+                                      for r in rows]}
+
+
+@app.get("/friction-calibrations/{cid}")
+def get_friction_calibration(cid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """标定详情：所选版本的冻结参数、原始点、拟合参数与人工决定。"""
+    return _calibration_detail(_fetch_calibration(conn, cid))
+
+
+@app.get("/friction-calibrations/{cid}/package")
+def calibration_package(cid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """JSON 标定包：原始点、拟合参数、人工决定、批次身份与修订链。"""
+    cal = _fetch_calibration(conn, cid)
+    proc = _fetch_proc(conn, cal["procedure_id"])
+    chain = conn.execute(
+        "SELECT id, revision, parent_id, status, change_note, confirmed_at,"
+        " created_at FROM friction_calibrations WHERE procedure_id=?"
+        " ORDER BY revision", (cal["procedure_id"],)).fetchall()
+    return {
+        **_calibration_detail(cal),
+        "procedure": {"id": proc["id"], "version": proc["version"],
+                      "status": proc["status"],
+                      "flange_class": proc["flange_class"],
+                      "target_torque": proc["target_torque"],
+                      "tool_range_min": proc["tool_range_min"],
+                      "tool_range_max": proc["tool_range_max"],
+                      "adopted_calibration_id": proc["adopted_calibration_id"]},
+        "fastener_state": _current_fastener_state(conn, proc["id"]),
+        "revision_chain": [dict(r) for r in chain],
+        "generated_at": utcnow(),
+    }
+
+
+@app.post("/friction-calibrations/{cid}/revisions", status_code=201)
+def create_calibration_revision(cid: int, body: CalibrationRevisionCreate,
+                                conn: sqlite3.Connection = Depends(get_db)):
+    """人工改贴合点、剔除/恢复试样或更换试样数据：必须说明理由，派生新修订。
+
+    旧修订废止不覆盖；批次身份与冻结几何/通道/目标载荷不可经修订改变。
+    """
+    cal = _fetch_calibration(conn, cid)
+    if cal["status"] == "superseded":
+        raise HTTPException(409, detail={
+            "reason": "calibration_superseded",
+            "message": f"摩擦标定 {cid} 已被修订 {cal['revision'] + 1} 废止，"
+                       "请基于最新修订派生",
+        })
+    payload = json.loads(json.dumps(cal["payload"]))  # 深拷贝，旧版不可变
+    changed = False
+    if body.specimens is not None:
+        payload["specimens"] = [json.loads(s.model_dump_json())
+                                for s in body.specimens]
+        changed = True
+    if body.seating_overrides:
+        overrides = payload.get("seating_overrides") or {}
+        for key, idx in body.seating_overrides.items():
+            if idx is None:
+                overrides.pop(key, None)
+            else:
+                overrides[key] = idx
+        payload["seating_overrides"] = overrides
+        changed = True
+    if body.exclude:
+        _apply_exclusions(payload, body.exclude)
+        changed = True
+    if body.include:
+        _apply_inclusions(payload, body.include)
+        changed = True
+    if not changed:
+        raise HTTPException(409, detail={
+            "reason": "empty_revision",
+            "message": "空修订：未变更任何内容；人工改贴合点、剔除/恢复试样或"
+                       "更换试样数据须给出具体变更",
+        })
+    _check_seating_overrides(payload)
+    analysis = evaluate_calibration(cal["frozen"], payload)
+    state = _current_fastener_state(conn, cal["procedure_id"])
+    status = _calibration_status_for(cal["identity"], state)
+    new_id = _insert_calibration(conn, cal["procedure_id"], cal["revision"] + 1,
+                                 cid, payload, cal["frozen"], analysis,
+                                 status=status, change_note=body.reason)
+    conn.execute("UPDATE friction_calibrations SET status='superseded' WHERE id=?",
+                 (cid,))
+    conn.commit()
+    new_cal = _fetch_calibration(conn, new_id)
+    return {
+        "friction_calibration": _calibration_detail(new_cal),
+        "derived_from": cid,
+        "diff": diff_calibrations(
+            {"frozen": cal["frozen"], "payload": cal["payload"],
+             "analysis": cal["analysis"]},
+            {"frozen": new_cal["frozen"], "payload": new_cal["payload"],
+             "analysis": new_cal["analysis"], "change_note": body.reason}),
+    }
+
+
+def _apply_exclusions(payload: dict, exclusions) -> None:
+    """按 试样/装配次 标记剔除并记录理由；目标不存在即 422。"""
+    by_no = {s["specimen_no"]: s for s in payload["specimens"]}
+    for ex in exclusions:
+        spec = by_no.get(ex.specimen_no)
+        if spec is None:
+            raise HTTPException(422, detail={
+                "reason": "unknown_specimen",
+                "message": f"试样 {ex.specimen_no!r} 不存在，无法剔除",
+            })
+        if ex.assembly_index is None:
+            spec["excluded"] = True
+            spec["exclusion_reason"] = ex.reason
+            continue
+        asm = next((a for a in spec["assemblies"]
+                    if a["assembly_index"] == ex.assembly_index), None)
+        if asm is None:
+            raise HTTPException(422, detail={
+                "reason": "unknown_assembly",
+                "message": f"试样 {ex.specimen_no!r} 无第 {ex.assembly_index} "
+                           "次装配，无法剔除",
+            })
+        asm["excluded"] = True
+        asm["exclusion_reason"] = ex.reason
+
+
+def _apply_inclusions(payload: dict, inclusions) -> None:
+    """撤销剔除（恢复参与统计）；目标不存在或未被剔除即 422。"""
+    by_no = {s["specimen_no"]: s for s in payload["specimens"]}
+    for inc in inclusions:
+        spec = by_no.get(inc.specimen_no)
+        if spec is None:
+            raise HTTPException(422, detail={
+                "reason": "unknown_specimen",
+                "message": f"试样 {inc.specimen_no!r} 不存在，无法恢复",
+            })
+        if inc.assembly_index is None:
+            if not spec.get("excluded"):
+                raise HTTPException(422, detail={
+                    "reason": "specimen_not_excluded",
+                    "message": f"试样 {inc.specimen_no!r} 未被剔除",
+                })
+            spec["excluded"] = False
+            spec["exclusion_reason"] = None
+            continue
+        asm = next((a for a in spec["assemblies"]
+                    if a["assembly_index"] == inc.assembly_index), None)
+        if asm is None:
+            raise HTTPException(422, detail={
+                "reason": "unknown_assembly",
+                "message": f"试样 {inc.specimen_no!r} 无第 {inc.assembly_index} 次装配",
+            })
+        if not asm.get("excluded"):
+            raise HTTPException(422, detail={
+                "reason": "assembly_not_excluded",
+                "message": f"试样 {inc.specimen_no!r} 第 {inc.assembly_index} "
+                           "次装配未被剔除",
+            })
+        asm["excluded"] = False
+        asm["exclusion_reason"] = None
+
+
+@app.post("/friction-calibrations/{cid}/confirm")
+def confirm_friction_calibration(cid: int, body: ReviewRequest | None = None,
+                                 conn: sqlite3.Connection = Depends(get_db)):
+    """确认标定版：无草稿阻断项才可通过；否则 409 返回阻断项，标定停在草稿。"""
+    cal = _fetch_calibration(conn, cid)
+    if cal["status"] == "pending_review":
+        raise HTTPException(409, detail={
+            "reason": "calibration_pending_review",
+            "message": f"摩擦标定 {cid} 因批次变化处于待复核状态，不能确认；"
+                       "请复核后恢复（reinstate）或派生修订",
+        })
+    if cal["status"] != "draft":
+        raise HTTPException(409, detail={
+            "reason": f"calibration_{cal['status']}",
+            "message": f"摩擦标定 {cid} 当前状态 {cal['status']}，仅草稿可确认",
+        })
+    analysis = cal["analysis"]
+    if not analysis["confirmable"]:
+        raise HTTPException(409, detail={
+            "reason": "calibration_not_confirmable",
+            "message": "存在草稿阻断项，标定停在草稿；消除阻断项或派生修订后再确认",
+            "blockers": analysis["blockers"],
+            "blocker_messages": analysis["blocker_messages"],
+            "gaps": analysis["gaps"],
+        })
+    conn.execute(
+        "UPDATE friction_calibrations SET status='confirmed', confirmed_at=?,"
+        " decided_by=?, decision_note=? WHERE id=?",
+        (utcnow(), body.reviewer if body else None,
+         body.note if body else None, cid))
+    conn.commit()
+    return _calibration_detail(_fetch_calibration(conn, cid))
+
+
+@app.post("/friction-calibrations/{cid}/reinstate")
+def reinstate_calibration(cid: int, body: CalibrationReinstateRequest,
+                          conn: sqlite3.Connection = Depends(get_db)):
+    """待复核 复核恢复：人工确认批次变化不影响本标定，恢复为草稿（决定留痕）。"""
+    cal = _fetch_calibration(conn, cid)
+    if cal["status"] != "pending_review":
+        raise HTTPException(409, detail={
+            "reason": f"calibration_{cal['status']}",
+            "message": f"摩擦标定 {cid} 当前状态 {cal['status']}，"
+                       "仅待复核（pending_review）标定可恢复",
+        })
+    conn.execute(
+        "UPDATE friction_calibrations SET status='draft', decided_by=?,"
+        " decision_note=? WHERE id=?",
+        (body.reviewer, f"待复核解除：{body.note}", cid))
+    conn.commit()
+    return _calibration_detail(_fetch_calibration(conn, cid))
+
+
+@app.get("/friction-calibrations/{cid}/diff")
+def friction_calibration_diff(cid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """与上一修订的差异：冻结参数、试样数据、人工决定（贴合点/剔除）与结果变化。"""
+    cal = _fetch_calibration(conn, cid)
+    if cal["parent_id"] is None:
+        raise HTTPException(409, detail={
+            "reason": "no_previous_revision",
+            "message": f"摩擦标定修订 {cal['revision']} 为首版，无历史修订可对比",
+        })
+    prev = _fetch_calibration(conn, cal["parent_id"])
+    return {
+        "procedure_id": cal["procedure_id"],
+        "from_calibration_id": prev["id"], "to_calibration_id": cid,
+        "from_revision": prev["revision"], "to_revision": cal["revision"],
+        "diff": diff_calibrations(
+            {"frozen": prev["frozen"], "payload": prev["payload"],
+             "analysis": prev["analysis"]},
+            {"frozen": cal["frozen"], "payload": cal["payload"],
+             "analysis": cal["analysis"], "change_note": cal["change_note"]}),
     }

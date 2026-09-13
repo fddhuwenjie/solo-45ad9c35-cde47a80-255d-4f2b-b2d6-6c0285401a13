@@ -58,6 +58,7 @@ TABLE_SINCE: dict[str, int] = {
     "site_constraints": 5, "plan_revisions": 5,
     "tensioning_plans": 6, "tensioning_reports": 6, "tensioning_channels": 6,
     "thermal_cases": 7, "thermal_gaps": 7,
+    "friction_calibrations": 8, "fastener_states": 8,
 }
 
 # 每表当前全量列（NOT NULL/默认值差异由 SQL 迁移本身保证，这里核对存在性）
@@ -71,6 +72,8 @@ COLUMNS: dict[str, tuple[str, ...]] = {
         "curve_direction", "snug_torque", "post_snug_angle_min_deg",
         "post_snug_angle_max_deg", "max_sample_interval_ms", "slope_drop_limit",
         "max_outlier_rate_pct",
+        # v8 批准时引用的摩擦标定版
+        "adopted_calibration_id",
         "created_at", "approved_at", "started_at", "completed_at", "reviewed_at",
         "archived_at", "reviewer", "review_note",
     ),
@@ -154,6 +157,14 @@ COLUMNS: dict[str, tuple[str, ...]] = {
         "id", "case_id", "revision", "bolt_no", "reason", "message", "interval",
         "created_at",
     ),
+    "friction_calibrations": (
+        "id", "procedure_id", "revision", "parent_id", "status", "identity_key",
+        "payload", "frozen", "analysis", "change_note", "decided_by",
+        "decision_note", "confirmed_at", "created_at",
+    ),
+    "fastener_states": (
+        "id", "procedure_id", "revision", "payload", "created_at",
+    ),
 }
 
 # procedures 的轨迹复核列自 v3 才有
@@ -162,6 +173,9 @@ _PROCEDURE_COLUMNS_V3 = {
     "post_snug_angle_max_deg", "max_sample_interval_ms", "slope_drop_limit",
     "max_outlier_rate_pct",
 }
+
+# procedures 的标定引用列自 v8 才有
+_PROCEDURE_COLUMNS_V8 = {"adopted_calibration_id"}
 
 # 表 -> 应当存在的 UNIQUE 索引列组（DDL 中 UNIQUE(...) 约束）
 UNIQUE_INDEXES: dict[str, tuple[tuple[str, ...], ...]] = {
@@ -174,11 +188,14 @@ UNIQUE_INDEXES: dict[str, tuple[tuple[str, ...], ...]] = {
     "tensioning_plans": (("procedure_id", "revision"),),
     "tensioning_reports": (("plan_id", "round_no", "group_no"),),
     "thermal_cases": (("procedure_id", "revision"),),
+    "friction_calibrations": (("procedure_id", "revision"),),
+    "fastener_states": (("procedure_id", "revision"),),
 }
 
 # 表 -> 应当存在的外键（列, 引用表）
 FOREIGN_KEYS: dict[str, frozenset[tuple[str, str]]] = {
-    "procedures": frozenset({("parent_id", "procedures")}),
+    "procedures": frozenset({("parent_id", "procedures"),
+                             ("adopted_calibration_id", "friction_calibrations")}),
     "records": frozenset({("procedure_id", "procedures"),
                           ("rework_of", "records")}),
     "anomalies": frozenset({("procedure_id", "procedures")}),
@@ -210,10 +227,15 @@ FOREIGN_KEYS: dict[str, frozenset[tuple[str, str]]] = {
     "thermal_cases": frozenset({("procedure_id", "procedures"),
                                 ("parent_id", "thermal_cases")}),
     "thermal_gaps": frozenset({("case_id", "thermal_cases")}),
+    "friction_calibrations": frozenset({
+        ("procedure_id", "procedures"),
+        ("parent_id", "friction_calibrations")}),
+    "fastener_states": frozenset({("procedure_id", "procedures")}),
 }
 
 # user_version=0 旧库的版本标记表（取现存最高标记推断结构版本）
 MARKER_TABLES: tuple[tuple[str, int], ...] = (
+    ("friction_calibrations", 8),
     ("thermal_gaps", 7),
     ("tensioning_channels", 6),
     ("plan_revisions", 5),
@@ -343,9 +365,23 @@ def _foreign_keys(conn: sqlite3.Connection, table: str) -> set[tuple[str, str]]:
 
 def _expected_columns(table: str, version: int) -> set[str]:
     cols = set(COLUMNS[table])
-    if table == "procedures" and version < 3:
-        cols -= _PROCEDURE_COLUMNS_V3
+    if table == "procedures":
+        if version < 3:
+            cols -= _PROCEDURE_COLUMNS_V3
+        if version < 8:
+            cols -= _PROCEDURE_COLUMNS_V8
     return cols
+
+
+# procedures 的标定引用外键自 v8 才有（列同时新增）
+_PROCEDURE_FKS_V8 = frozenset({("adopted_calibration_id", "friction_calibrations")})
+
+
+def _expected_fks(table: str, version: int) -> frozenset[tuple[str, str]]:
+    fks = FOREIGN_KEYS.get(table, frozenset())
+    if table == "procedures" and version < 8:
+        fks = fks - _PROCEDURE_FKS_V8
+    return fks
 
 
 def verify_schema(conn: sqlite3.Connection, version: int) -> list[str]:
@@ -361,7 +397,7 @@ def verify_schema(conn: sqlite3.Connection, version: int) -> list[str]:
         missing_cols = _expected_columns(table, version) - _table_columns(conn, table)
         problems.extend(f"column:{table}.{c}" for c in sorted(missing_cols))
         actual_fks = _foreign_keys(conn, table)
-        for column, ref in FOREIGN_KEYS.get(table, frozenset()):
+        for column, ref in _expected_fks(table, version):
             if (column, ref) not in actual_fks:
                 problems.append(f"foreign_key:{table}.{column}->{ref}")
         actual_indexes = _unique_index_columns(conn, table)
