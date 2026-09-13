@@ -300,6 +300,112 @@ class CurveAmend(BaseModel):
     record_id: int | None = Field(None, ge=1, description="重新关联的终轮记录 id；缺省不变")
 
 
+# ---------------------------------------------------------------- 液压张拉执行
+
+class TensioningPlanCreate(BaseModel):
+    """从 approved（及以后）工艺建立液压张拉方案：冻结螺栓/机具/仪表参数。
+
+    冻结后任何参数变化须派生修订（说明理由）；分轮换位方案随创建生成。
+    """
+
+    area_mm2: float = Field(..., gt=0, description="螺栓有效（应力）截面积 A_s（mm²）")
+    length_mm: float = Field(..., gt=0, description="螺栓有效长度 L_eff（mm，行程预测基准）")
+    elastic_modulus_mpa: float = Field(..., gt=0, description="弹性模量 E（MPa = N/mm²）")
+    target_load_kn: float = Field(..., gt=0, description="目标预紧力 F_target（kN）")
+    load_tolerance_pct: float = Field(..., gt=0, le=50, description="残余预紧力允许偏差 ±%")
+    tensioner_id: str = Field(..., min_length=1, description="液压拉伸器编号")
+    tensioner_count: int = Field(..., ge=1, description="可同时安装的拉伸器数量（栓组大小上限）")
+    hydraulic_area_mm2: float = Field(..., gt=0, description="拉伸器液压有效面积 A_h（mm²）")
+    max_pressure_mpa: float = Field(..., gt=0, description="拉伸器/泵最大压力（MPa，能力上限）")
+    max_stroke_mm: float = Field(..., gt=0, description="拉伸器最大活塞行程（mm）")
+    min_tool_spacing: int = Field(..., ge=1, description="相邻机具最小栓位间隔（防相撞，栓位数）")
+    load_transfer_coefficient: float = Field(
+        ..., ge=0, lt=1, description="载荷转移系数 λ（卸压后残余 = 施加 × (1−λ)）")
+    min_hold_seconds: float = Field(..., ge=0, description="最短保压时间（s）")
+    pressure_sync_tolerance_pct: float = Field(
+        ..., gt=0, le=100, description="组内压力同步允差（%，极差/均值）")
+    gauge_id: str = Field(..., min_length=1, description="压力表编号")
+    gauge_calibration_until: date = Field(..., description="压力表校准有效期（含当日）")
+    stage_ratios: list[float] = Field(..., description="分轮比例，严格递增且末级 1.0")
+
+    @field_validator("stage_ratios")
+    @classmethod
+    def _check_ratios(cls, v: list[float]) -> list[float]:
+        if not v:
+            raise ValueError("分轮比例不能为空")
+        if any(r <= 0 or r > 1 for r in v):
+            raise ValueError("分轮比例须在 (0, 1] 区间内")
+        if any(b <= a for a, b in zip(v, v[1:])):
+            raise ValueError("分轮比例须严格递增（分轮递增规则）")
+        if abs(v[-1] - 1.0) > 1e-9:
+            raise ValueError("末级比例须为 1.0（最终轮达到目标预紧力）")
+        return v
+
+
+class TensioningChannelReport(BaseModel):
+    """单个拉伸器通道回传：栓号、通道压力与活塞行程。"""
+
+    bolt_no: int = Field(..., ge=1, description="螺栓编号 1..N")
+    pressure_mpa: float = Field(..., gt=0, description="通道压力（MPa）")
+    stroke_mm: float = Field(..., ge=0, description="活塞行程（mm）")
+
+
+class TensioningRoundReport(BaseModel):
+    """分组回传：同组各通道压力/行程、保压时段与卸压次序。"""
+
+    round_no: int = Field(..., ge=1, description="轮次号")
+    group_no: int = Field(..., ge=1, description="组号（方案内）")
+    operator: str = Field(..., min_length=1, description="操作者")
+    reported_at: datetime = Field(..., description="回传时刻 ISO 8601")
+    gauge_id: str = Field(..., min_length=1, description="实际使用的压力表编号")
+    hold_seconds: float = Field(..., ge=0, description="保压时段（s）")
+    release_order: list[int] = Field(..., min_length=1,
+                                     description="卸压次序（须恰好覆盖本组栓号）")
+    channels: list[TensioningChannelReport] = Field(..., min_length=1,
+                                                    description="各通道压力/行程")
+
+
+class TensioningRevisionCreate(BaseModel):
+    """人工改组/参数修订：必须说明理由，派生新修订；已完成组原位锁定，只重排未完成组。
+
+    仅填写需要变更的字段；空修订（无任何变更）将被拒绝。
+    """
+
+    reason: str = Field(..., min_length=1, description="修订理由（写入版本链）")
+    area_mm2: float | None = Field(None, gt=0)
+    length_mm: float | None = Field(None, gt=0)
+    elastic_modulus_mpa: float | None = Field(None, gt=0)
+    target_load_kn: float | None = Field(None, gt=0)
+    load_tolerance_pct: float | None = Field(None, gt=0, le=50)
+    tensioner_id: str | None = Field(None, min_length=1)
+    tensioner_count: int | None = Field(None, ge=1)
+    hydraulic_area_mm2: float | None = Field(None, gt=0)
+    max_pressure_mpa: float | None = Field(None, gt=0)
+    max_stroke_mm: float | None = Field(None, gt=0)
+    min_tool_spacing: int | None = Field(None, ge=1)
+    load_transfer_coefficient: float | None = Field(None, ge=0, lt=1)
+    min_hold_seconds: float | None = Field(None, ge=0)
+    pressure_sync_tolerance_pct: float | None = Field(None, gt=0, le=100)
+    gauge_id: str | None = Field(None, min_length=1)
+    gauge_calibration_until: date | None = None
+    stage_ratios: list[float] | None = None
+
+    @field_validator("stage_ratios")
+    @classmethod
+    def _check_ratios(cls, v: list[float] | None) -> list[float] | None:
+        if v is None:
+            return v
+        return TensioningPlanCreate._check_ratios(v)
+
+
+class TensioningAdoptUltrasonic(BaseModel):
+    """采用既有超声实测值作为残余预紧力证据：必须说明理由并派生修订。"""
+
+    reason: str = Field(..., min_length=1, description="采用理由（写入版本链）")
+    batch_id: int | None = Field(
+        None, description="超声测量批次 id；缺省取本工艺最新已确认批次")
+
+
 # ---------------------------------------------------------------- 装配对中预检
 
 LengthUnit = Literal["mm", "cm", "m", "in"]

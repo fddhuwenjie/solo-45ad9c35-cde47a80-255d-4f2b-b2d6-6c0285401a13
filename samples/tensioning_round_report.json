@@ -1,0 +1,13 @@
+{
+  "round_no": 1,
+  "group_no": 1,
+  "operator": "李四",
+  "reported_at": "2026-09-12T10:00:00",
+  "gauge_id": "PG-1",
+  "hold_seconds": 60.0,
+  "release_order": [5, 1],
+  "channels": [
+    {"bolt_no": 1, "pressure_mpa": 41.18, "stroke_mm": 0.30},
+    {"bolt_no": 5, "pressure_mpa": 41.18, "stroke_mm": 0.30}
+  ]
+}

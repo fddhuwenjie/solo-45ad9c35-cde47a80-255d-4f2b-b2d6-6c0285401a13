@@ -19,9 +19,13 @@ from .schemas import (AlignmentCheckCreate, BaselineRequest, CurveAmend, CurveSu
                       DeriveRequest, ExcludeRequest, MeasurementBatchCreate,
                       PlanRevisionCreate, RemeasurementRequest, RetestRequest,
                       ProcedureCreate, ReviewRequest, SiteConstraintsInput,
-                      TorqueReport)
+                      TensioningAdoptUltrasonic, TensioningPlanCreate,
+                      TensioningRevisionCreate, TensioningRoundReport, TorqueReport)
 from .sequencing import build_plan, sequence_violations
 from .svg import render_svg
+from .tensioning import (build_scheme, channel_results, diff_schemes, evaluate_plan,
+                         find_infeasible_rounds as find_infeasible_tension_rounds,
+                         flatten_groups, scheme_setpoints, validate_round_report)
 from .ultrasonic import GAP_MESSAGES, evaluate_batch, evaluate_reading
 STATUS_LABEL = {
     "draft": "已创建",
@@ -1190,6 +1194,7 @@ def job_package(pid: int, conn: sqlite3.Connection = Depends(get_db)):
         "revisions": _revision_chain(conn, pid),
         "alignment": alignment,
         "measurement": _measurement_reference(conn, pid),
+        "tensioning": _tensioning_reference(conn, pid),
         "curves": _curve_review(conn, proc),
         "generated_at": utcnow(),
     }
@@ -1754,4 +1759,488 @@ def derive_rework(bid: int, conn: sqlite3.Connection = Depends(get_db)):
         "plan": _proc_plan(conn, new_proc),
         "message": "补拧草稿已生成（末轮 100%）；批准、开工、回传后按同一冻结参数"
                    "建立新测量批次（仅补拧范围需基线/复测，锁定栓结果自动继承）",
+    }
+
+
+# ---------------------------------------------------------------- 液压张拉执行
+
+# 允许建立张拉方案的工艺状态（与超声批次一致：工艺参数已冻结）
+TENSION_CREATABLE = ("approved", "in_progress", "completed", "reviewed", "archived")
+# 允许回传/修订的方案状态
+TENSION_ACTIVE = ("open", "approved")
+
+TENSION_FROZEN_FIELDS = (
+    "area_mm2", "length_mm", "elastic_modulus_mpa", "target_load_kn",
+    "load_tolerance_pct", "tensioner_id", "tensioner_count", "hydraulic_area_mm2",
+    "max_pressure_mpa", "max_stroke_mm", "min_tool_spacing",
+    "load_transfer_coefficient", "min_hold_seconds", "pressure_sync_tolerance_pct",
+    "gauge_id", "gauge_calibration_until",
+)
+
+
+def _row_to_tension_plan(row: sqlite3.Row) -> dict:
+    plan = dict(row)
+    plan["stage_ratios"] = json.loads(plan["stage_ratios"])
+    plan["scheme_rounds"] = json.loads(plan.pop("scheme"))
+    snap = plan.get("ultrasonic_snapshot")
+    plan["ultrasonic_snapshot"] = json.loads(snap) if snap else None
+    return plan
+
+
+def _fetch_tension_plan(conn: sqlite3.Connection, tid: int) -> dict:
+    row = conn.execute("SELECT * FROM tensioning_plans WHERE id=?", (tid,)).fetchone()
+    if row is None:
+        raise HTTPException(404, f"张拉方案 {tid} 不存在")
+    return _row_to_tension_plan(row)
+
+
+def _current_tension_plan(conn: sqlite3.Connection, pid: int) -> dict | None:
+    """当前活动修订（最新未废止修订）；批准快照/版本差异/作业包共用同一行。"""
+    row = conn.execute(
+        "SELECT * FROM tensioning_plans WHERE procedure_id=? AND status!='superseded'"
+        " ORDER BY revision DESC", (pid,)).fetchone()
+    return _row_to_tension_plan(row) if row else None
+
+
+def _tension_lineage_ids(conn: sqlite3.Connection, plan: dict) -> list[int]:
+    """当前修订所在谱系（沿 parent_id 上溯）的全部方案 id。"""
+    ids = [plan["id"]]
+    parent = plan["parent_id"]
+    while parent is not None:
+        ids.append(parent)
+        row = conn.execute("SELECT parent_id FROM tensioning_plans WHERE id=?",
+                           (parent,)).fetchone()
+        parent = row["parent_id"] if row else None
+    return ids
+
+
+def _tension_reports(conn: sqlite3.Connection, plan: dict) -> list[dict]:
+    """当前谱系全部已接受回传（跨修订，按 id 升序）；新谱系从空开始。"""
+    ids = _tension_lineage_ids(conn, plan)
+    marks = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT * FROM tensioning_reports WHERE plan_id IN ({marks}) ORDER BY id",
+        ids).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["release_order"] = json.loads(d["release_order"])
+        out.append(d)
+    return out
+
+
+def _tension_channels(conn: sqlite3.Connection, report_ids: list[int]) -> dict[int, list[dict]]:
+    if not report_ids:
+        return {}
+    marks = ",".join("?" for _ in report_ids)
+    rows = conn.execute(
+        f"SELECT * FROM tensioning_channels WHERE report_id IN ({marks})"
+        " ORDER BY id", report_ids).fetchall()
+    out: dict[int, list[dict]] = {}
+    for r in rows:
+        d = dict(r)
+        out.setdefault(d["report_id"], []).append(
+            {k: d[k] for k in ("bolt_no", "pressure_mpa", "stroke_mm",
+                               "applied_load_kn", "residual_load_kn")})
+    return out
+
+
+def _done_tension_groups(reports: list[dict]) -> list[dict]:
+    return [{"round_no": r["round_no"], "group_no": r["group_no"]} for r in reports]
+
+
+def _tension_detail(conn: sqlite3.Connection, plan: dict) -> dict:
+    """方案详情：冻结参数、分轮换位方案（含逐组状态）、回传与评估结论。
+
+    方案详情路由、版本差异与 JSON 作业包统一读取本视图（同一张拉方案与结果）。
+    """
+    proc = _fetch_proc(conn, plan["procedure_id"])
+    reports = _tension_reports(conn, plan)
+    channels = _tension_channels(conn, [r["id"] for r in reports])
+    evaluation = evaluate_plan(plan, plan["scheme_rounds"], reports, channels)
+    status_by_key = {(g["round_no"], g["group_no"]): g for g in evaluation["groups"]}
+    scheme = []
+    for rd in scheme_setpoints(plan, plan["scheme_rounds"]):
+        groups = []
+        for g in rd["groups"]:
+            key = (rd["round_no"], g["group_no"])
+            view = status_by_key.get(key, {})
+            groups.append({**g, "status": view.get("status", "pending"),
+                           "report_id": view.get("report_id")})
+        scheme.append({**rd, "groups": groups})
+    chain = conn.execute(
+        "SELECT id, revision, parent_id, status, change_note, approved_at, created_at"
+        " FROM tensioning_plans WHERE procedure_id=? ORDER BY revision",
+        (plan["procedure_id"],)).fetchall()
+    return {
+        "plan": {**{k: plan[k] for k in TENSION_FROZEN_FIELDS},
+                 "stage_ratios": plan["stage_ratios"],
+                 "id": plan["id"], "procedure_id": plan["procedure_id"],
+                 "revision": plan["revision"], "parent_id": plan["parent_id"],
+                 "status": plan["status"],
+                 "ultrasonic_batch_id": plan["ultrasonic_batch_id"],
+                 "change_note": plan["change_note"],
+                 "approved_at": plan["approved_at"],
+                 "confirmed_at": plan["confirmed_at"],
+                 "created_at": plan["created_at"]},
+        "procedure_status": proc["status"],
+        "scheme": scheme,
+        "reports": [{**r, "channels": channels.get(r["id"], [])} for r in reports],
+        "evaluation": evaluation,
+        "revision_chain": [dict(r) for r in chain],
+    }
+
+
+def _tensioning_reference(conn: sqlite3.Connection, pid: int) -> dict | None:
+    plan = _current_tension_plan(conn, pid)
+    return _tension_detail(conn, plan) if plan else None
+
+
+def _tension_feasibility_gate(plan: dict) -> None:
+    """创建/批准/修订前预检：逐轮设定泵压不超能力、预测行程不超限。"""
+    conflicts = find_infeasible_tension_rounds(plan)
+    if conflicts:
+        desc = "；".join(
+            f"比例 {c['round_ratio']} 轮需 {c['required_pressure_mpa']}MPa/"
+            f"{c['required_stroke_mm']}mm，超上限 {c['max_pressure_mpa']}MPa/"
+            f"{c['max_stroke_mm']}mm" for c in conflicts)
+        raise HTTPException(409, detail={
+            "reason": "tensioning_infeasible",
+            "message": f"以下轮次任何回传都无法合格：{desc}",
+            "conflicts": conflicts,
+        })
+
+
+def _insert_tension_plan(conn: sqlite3.Connection, pid: int, params: dict, *,
+                         revision: int, parent_id: int | None, status: str,
+                         scheme_rounds: list[dict], change_note: str | None,
+                         ultrasonic_batch_id: int | None = None,
+                         ultrasonic_snapshot: dict | None = None) -> int:
+    cur = conn.execute(
+        """INSERT INTO tensioning_plans
+           (procedure_id, revision, parent_id, status, area_mm2, length_mm,
+            elastic_modulus_mpa, target_load_kn, load_tolerance_pct, tensioner_id,
+            tensioner_count, hydraulic_area_mm2, max_pressure_mpa, max_stroke_mm,
+            min_tool_spacing, load_transfer_coefficient, min_hold_seconds,
+            pressure_sync_tolerance_pct, gauge_id, gauge_calibration_until,
+            stage_ratios, scheme, ultrasonic_batch_id, ultrasonic_snapshot,
+            change_note, approved_at, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (pid, revision, parent_id, status, params["area_mm2"], params["length_mm"],
+         params["elastic_modulus_mpa"], params["target_load_kn"],
+         params["load_tolerance_pct"], params["tensioner_id"],
+         params["tensioner_count"], params["hydraulic_area_mm2"],
+         params["max_pressure_mpa"], params["max_stroke_mm"],
+         params["min_tool_spacing"], params["load_transfer_coefficient"],
+         params["min_hold_seconds"], params["pressure_sync_tolerance_pct"],
+         params["gauge_id"], params["gauge_calibration_until"],
+         json.dumps(params["stage_ratios"]), json.dumps(scheme_rounds),
+         ultrasonic_batch_id,
+         json.dumps(ultrasonic_snapshot) if ultrasonic_snapshot else None,
+         change_note, utcnow() if status == "approved" else None, utcnow()),
+    )
+    return cur.lastrowid
+
+
+def _derive_tension_revision(conn: sqlite3.Connection, plan: dict, *,
+                             reason: str, overrides: dict,
+                             ultrasonic_batch_id: int | None = None,
+                             ultrasonic_snapshot: dict | None = None) -> dict:
+    """派生新修订：已完成组原位锁定，仅未完成组按新参数重排；旧修订废止。"""
+    params = {**{k: plan[k] for k in TENSION_FROZEN_FIELDS},
+              "stage_ratios": plan["stage_ratios"]}
+    params.update(overrides)
+    try:
+        data = TensioningPlanCreate(**params)
+    except ValidationError as exc:
+        raise HTTPException(422, detail=json.loads(exc.json()))
+    new_params = data.model_dump()
+    new_params["gauge_calibration_until"] = data.gauge_calibration_until.isoformat()
+    _tension_feasibility_gate(new_params)
+
+    proc = _fetch_proc(conn, plan["procedure_id"])
+    reports = _tension_reports(conn, plan)
+    done_keys = {(r["round_no"], r["group_no"]) for r in reports}
+    locked_groups = [
+        {"round_no": rd["round_no"], "group_no": g["group_no"], "bolts": g["bolts"]}
+        for rd in plan["scheme_rounds"] for g in rd["groups"]
+        if (rd["round_no"], g["group_no"]) in done_keys
+    ]
+    rounds = build_scheme(proc["bolt_count"], new_params["stage_ratios"],
+                          new_params["tensioner_count"],
+                          new_params["min_tool_spacing"], locked_groups=locked_groups)
+    new_status = plan["status"]  # open→open / approved→approved（批准快照随修订更新）
+    new_id = _insert_tension_plan(
+        conn, plan["procedure_id"], new_params, revision=plan["revision"] + 1,
+        parent_id=plan["id"], status=new_status, scheme_rounds=rounds,
+        change_note=reason, ultrasonic_batch_id=ultrasonic_batch_id,
+        ultrasonic_snapshot=ultrasonic_snapshot)
+    conn.execute("UPDATE tensioning_plans SET status='superseded' WHERE id=?",
+                 (plan["id"],))
+    conn.commit()
+    return _fetch_tension_plan(conn, new_id)
+
+
+@app.post("/procedures/{pid}/tensioning-plans", status_code=201)
+def create_tensioning_plan(pid: int, data: TensioningPlanCreate,
+                           conn: sqlite3.Connection = Depends(get_db)):
+    """建立液压张拉方案：冻结截面/目标预紧力/拉伸器能力与行程/压力表校准/
+    栓组与载荷转移系数，并生成分轮换位方案（每轮全覆盖、组内同步、逐轮换位）。"""
+    proc = _fetch_proc(conn, pid)
+    if proc["status"] not in TENSION_CREATABLE:
+        raise HTTPException(409, detail={
+            "reason": "not_approvable_for_tensioning",
+            "message": f"工艺 {pid} 当前状态 {proc['status']}，须经批准（approved）后才能"
+                       "建立张拉方案",
+        })
+    existing = _current_tension_plan(conn, pid)
+    if existing is not None and existing["status"] in TENSION_ACTIVE:
+        raise HTTPException(409, detail={
+            "reason": "active_plan_exists",
+            "message": f"工艺 {pid} 已有活动张拉方案 {existing['id']}"
+                       f"（修订 {existing['revision']}，状态 {existing['status']}）；"
+                       "改组或参数变化须派生修订",
+            "plan_id": existing["id"],
+        })
+    params = data.model_dump()
+    params["gauge_calibration_until"] = data.gauge_calibration_until.isoformat()
+    _tension_feasibility_gate(params)
+    rounds = build_scheme(proc["bolt_count"], data.stage_ratios, data.tensioner_count,
+                          data.min_tool_spacing)
+    row = conn.execute(
+        "SELECT MAX(revision) r FROM tensioning_plans WHERE procedure_id=?",
+        (pid,)).fetchone()
+    new_id = _insert_tension_plan(conn, pid, params, revision=(row["r"] or 0) + 1,
+                                  parent_id=None, status="open",
+                                  scheme_rounds=rounds, change_note=None)
+    conn.commit()
+    return _tension_detail(conn, _fetch_tension_plan(conn, new_id))
+
+
+@app.get("/procedures/{pid}/tensioning-plans")
+def list_tensioning_plans(pid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """张拉方案修订链（逐版保留，旧修订不覆盖）。"""
+    _fetch_proc(conn, pid)
+    rows = conn.execute(
+        "SELECT id, revision, parent_id, status, change_note, approved_at,"
+        " confirmed_at, created_at FROM tensioning_plans WHERE procedure_id=?"
+        " ORDER BY revision", (pid,)).fetchall()
+    return {"procedure_id": pid, "tensioning_plans": [dict(r) for r in rows]}
+
+
+@app.get("/tensioning-plans/{tid}")
+def get_tensioning_plan(tid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """方案详情：冻结参数、分轮换位方案、逐组回传结果与确认评估。"""
+    return _tension_detail(conn, _fetch_tension_plan(conn, tid))
+
+
+@app.post("/tensioning-plans/{tid}/approve")
+def approve_tensioning_plan(tid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """批准张拉方案：冻结批准快照（修订内容不可变），批准前复核逐轮可行性。"""
+    plan = _fetch_tension_plan(conn, tid)
+    if plan["status"] != "open":
+        raise HTTPException(409, detail={
+            "reason": "plan_not_open",
+            "message": f"张拉方案 {tid} 当前状态 {plan['status']}，须为 open 才能批准",
+        })
+    _tension_feasibility_gate(plan)
+    conn.execute("UPDATE tensioning_plans SET status='approved', approved_at=?"
+                 " WHERE id=?", (utcnow(), tid))
+    conn.commit()
+    return _tension_detail(conn, _fetch_tension_plan(conn, tid))
+
+
+@app.post("/tensioning-plans/{tid}/round-reports", status_code=201)
+def submit_tension_round_report(tid: int, report: TensioningRoundReport,
+                                conn: sqlite3.Connection = Depends(get_db)):
+    """分组回传：各通道压力/行程、保压时段与卸压次序。
+
+    机具超行程、压力不同步、覆盖冲突、校准失效、保压不足或残余预紧力超差时，
+    定位栓号与原始区间、记录异常并拒绝推进（该组须整改后重新回传）。
+    """
+    plan = _fetch_tension_plan(conn, tid)
+    proc = _fetch_proc(conn, plan["procedure_id"])
+    reports = _tension_reports(conn, plan)
+    done = _done_tension_groups(reports)
+    rejection = validate_round_report(plan, plan["scheme_rounds"], done, report,
+                                      proc["status"])
+    if rejection is not None:
+        conn.execute(
+            "INSERT INTO anomalies (procedure_id, bolt_no, reason, message, payload,"
+            " created_at) VALUES (?,?,?,?,?,?)",
+            (proc["id"], rejection.bolt_no, rejection.reason, rejection.message,
+             report.model_dump_json(), utcnow()))
+        conn.commit()
+        raise HTTPException(409, detail=rejection.as_detail())
+
+    cur = conn.execute(
+        """INSERT INTO tensioning_reports
+           (plan_id, plan_revision, round_no, group_no, operator, reported_at,
+            gauge_id, hold_seconds, release_order, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (tid, plan["revision"], report.round_no, report.group_no, report.operator,
+         report.reported_at.isoformat(), report.gauge_id, report.hold_seconds,
+         json.dumps(report.release_order), utcnow()))
+    report_id = cur.lastrowid
+    results = channel_results(plan, report)
+    for ch in results:
+        conn.execute(
+            """INSERT INTO tensioning_channels
+               (report_id, bolt_no, pressure_mpa, stroke_mm, applied_load_kn,
+                residual_load_kn) VALUES (?,?,?,?,?,?)""",
+            (report_id, ch["bolt_no"], ch["pressure_mpa"], ch["stroke_mm"],
+             ch["applied_load_kn"], ch["residual_load_kn"]))
+    conn.commit()
+
+    sequence = flatten_groups(plan["scheme_rounds"])
+    next_group = (sequence[len(done) + 1] if len(done) + 1 < len(sequence) else None)
+    return {
+        "report_id": report_id,
+        "plan_id": tid,
+        "plan_revision": plan["revision"],
+        "round_no": report.round_no,
+        "group_no": report.group_no,
+        "channels": results,
+        "completed_groups": len(done) + 1,
+        "total_groups": len(sequence),
+        "next_group": next_group,
+    }
+
+
+@app.post("/tensioning-plans/{tid}/confirm")
+def confirm_tensioning_plan(tid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """确认张拉方案：全部组回传完成且末轮逐栓残余预紧力落入目标带。
+
+    存在覆盖缺口或残余预紧力超差时返回 409 与逐栓明细，方案保持 approved。
+    """
+    plan = _fetch_tension_plan(conn, tid)
+    if plan["status"] != "approved":
+        raise HTTPException(409, detail={
+            "reason": "plan_not_approved",
+            "message": f"张拉方案 {tid} 当前状态 {plan['status']}，须为 approved 才能确认",
+        })
+    detail = _tension_detail(conn, plan)
+    evaluation = detail["evaluation"]
+    if not evaluation["confirmable"]:
+        parts: list[str] = []
+        if evaluation["missing_groups"]:
+            miss = "、".join(f"R{g['round_no']}G{g['group_no']}"
+                             for g in evaluation["missing_groups"])
+            parts.append(f"未回传组：{miss}")
+        if evaluation["out_of_band_bolts"]:
+            bolts = [b["bolt_no"] for b in evaluation["out_of_band_bolts"]]
+            parts.append(f"残余预紧力超差栓 {bolts}（目标带 "
+                         f"{evaluation['final_residual_band_kn']}kN，证据来源 "
+                         f"{evaluation['evidence_source']}）")
+        raise HTTPException(409, detail={
+            "reason": "tensioning_not_confirmed",
+            "message": "；".join(parts) + "；不能确认",
+            "blockers": evaluation["blockers"],
+            "evaluation": evaluation,
+        })
+    conn.execute("UPDATE tensioning_plans SET status='confirmed', confirmed_at=?"
+                 " WHERE id=?", (utcnow(), tid))
+    conn.commit()
+    return _tension_detail(conn, _fetch_tension_plan(conn, tid))
+
+
+@app.post("/tensioning-plans/{tid}/revisions", status_code=201)
+def create_tensioning_revision(tid: int, body: TensioningRevisionCreate,
+                               conn: sqlite3.Connection = Depends(get_db)):
+    """人工改组/参数修订：必须说明理由；已完成组原位锁定，只重排未完成组。"""
+    plan = _fetch_tension_plan(conn, tid)
+    if plan["status"] not in TENSION_ACTIVE:
+        raise HTTPException(409, detail={
+            "reason": f"plan_{plan['status']}",
+            "message": f"张拉方案 {tid} 当前状态 {plan['status']}，不能派生修订",
+        })
+    overrides = body.model_dump(exclude_none=True, exclude={"reason"})
+    if not overrides:
+        raise HTTPException(409, detail={
+            "reason": "empty_revision",
+            "message": "空修订：未变更任何冻结参数；人工改组请调整栓组/间隔/轮次等"
+                       "字段，采用超声实测值请用 adopt-ultrasonic",
+        })
+    new_plan = _derive_tension_revision(conn, plan, reason=body.reason,
+                                        overrides=overrides)
+    return {
+        "tensioning_plan": _tension_detail(conn, new_plan),
+        "derived_from": tid,
+        "diff": diff_schemes(plan, plan["scheme_rounds"],
+                             new_plan, new_plan["scheme_rounds"]),
+    }
+
+
+@app.post("/tensioning-plans/{tid}/adopt-ultrasonic", status_code=201)
+def adopt_ultrasonic(tid: int, body: TensioningAdoptUltrasonic,
+                     conn: sqlite3.Connection = Depends(get_db)):
+    """采用既有超声实测值作为残余预紧力证据：必须说明理由并派生修订。
+
+    快照取自本工艺已确认测量批次的逐栓换算载荷；确认时以实测值替代预测值。
+    """
+    plan = _fetch_tension_plan(conn, tid)
+    if plan["status"] not in TENSION_ACTIVE:
+        raise HTTPException(409, detail={
+            "reason": f"plan_{plan['status']}",
+            "message": f"张拉方案 {tid} 当前状态 {plan['status']}，不能派生修订",
+        })
+    pid = plan["procedure_id"]
+    if body.batch_id is not None:
+        batch = _fetch_batch(conn, body.batch_id)
+        if batch["procedure_id"] != pid:
+            raise HTTPException(409, detail={
+                "reason": "batch_procedure_mismatch",
+                "message": f"测量批次 {body.batch_id} 属于工艺 {batch['procedure_id']}，"
+                           f"与本方案工艺 {pid} 不符",
+            })
+        if batch["status"] != "confirmed":
+            raise HTTPException(409, detail={
+                "reason": "batch_not_confirmed",
+                "message": f"测量批次 {body.batch_id} 状态 {batch['status']}，"
+                           "仅已确认批次的实测值可被采用",
+            })
+    else:
+        row = conn.execute(
+            "SELECT id FROM measurement_batches WHERE procedure_id=?"
+            " AND status='confirmed' ORDER BY id DESC", (pid,)).fetchone()
+        if row is None:
+            raise HTTPException(409, detail={
+                "reason": "no_confirmed_batch",
+                "message": f"工艺 {pid} 无已确认超声测量批次，无法采用实测值",
+            })
+        batch = _fetch_batch(conn, row["id"])
+    verdict = _batch_detail(conn, batch)["verdict"]
+    snapshot = {
+        str(b["bolt_no"]): {"load_kn": b["load_kn"], "reading_id": b["reading_id"]}
+        for b in verdict["bolts"] if b["load_kn"] is not None and not b["gaps"]
+    }
+    new_plan = _derive_tension_revision(
+        conn, plan, reason=f"采用超声实测：{body.reason}", overrides={},
+        ultrasonic_batch_id=batch["id"], ultrasonic_snapshot=snapshot)
+    return {
+        "tensioning_plan": _tension_detail(conn, new_plan),
+        "derived_from": tid,
+        "adopted_batch_id": batch["id"],
+        "adopted_loads_kn": {k: v["load_kn"] for k, v in snapshot.items()},
+        "diff": diff_schemes(plan, plan["scheme_rounds"],
+                             new_plan, new_plan["scheme_rounds"]),
+    }
+
+
+@app.get("/tensioning-plans/{tid}/diff")
+def tensioning_plan_diff(tid: int, conn: sqlite3.Connection = Depends(get_db)):
+    """与上一修订的差异：冻结参数、逐轮分组（锁定组原位保留）与超声采纳变化。"""
+    plan = _fetch_tension_plan(conn, tid)
+    if plan["parent_id"] is None:
+        raise HTTPException(409, detail={
+            "reason": "no_previous_revision",
+            "message": f"张拉方案修订 {plan['revision']} 为首版，无历史修订可对比",
+        })
+    prev = _fetch_tension_plan(conn, plan["parent_id"])
+    return {
+        "procedure_id": plan["procedure_id"],
+        "from_plan_id": prev["id"], "to_plan_id": tid,
+        "from_revision": prev["revision"], "to_revision": plan["revision"],
+        "diff": diff_schemes(prev, prev["scheme_rounds"],
+                             plan, plan["scheme_rounds"]),
     }

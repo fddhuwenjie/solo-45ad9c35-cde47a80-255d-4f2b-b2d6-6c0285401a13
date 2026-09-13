@@ -1,0 +1,19 @@
+{
+  "area_mm2": 353.0,
+  "length_mm": 150.0,
+  "elastic_modulus_mpa": 206000.0,
+  "target_load_kn": 140.0,
+  "load_tolerance_pct": 10.0,
+  "tensioner_id": "HT-01",
+  "tensioner_count": 2,
+  "hydraulic_area_mm2": 2000.0,
+  "max_pressure_mpa": 100.0,
+  "max_stroke_mm": 5.0,
+  "min_tool_spacing": 2,
+  "load_transfer_coefficient": 0.15,
+  "min_hold_seconds": 30.0,
+  "pressure_sync_tolerance_pct": 5.0,
+  "gauge_id": "PG-1",
+  "gauge_calibration_until": "2026-12-31",
+  "stage_ratios": [0.5, 1.0]
+}

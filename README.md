@@ -225,6 +225,74 @@ n=4 数学上无法生成全程非相邻序列（1-3-2-4 中 3→2 相邻），�
   恢复序列、JSON 作业包（`planning` 字段）与圆周 SVG（实际方位、角区虚线弧、
   等待/换工具动作清单）读取同一冻结计划。
 
+## 液压张拉执行（拉伸器分组同步加压）
+
+大口径法兰用液压拉伸器张拉时，螺栓须分组同步加压：拉伸器数量不足、相邻机具
+相撞或卸压载荷转移，都可能让泵压记录看似正常而最终预紧力失衡。在扭矩流程
+之外增加**液压张拉执行模块**：方案与修订全部写入 SQLite，换算与校验为纯函数。
+
+### 建案（从 approved 工艺）
+
+`POST /procedures/{id}/tensioning-plans` 冻结以下参数（冻结后只能派生修订）：
+
+| 字段 | 说明 |
+|---|---|
+| `area_mm2` / `length_mm` / `elastic_modulus_mpa` | 螺栓有效截面 / 有效长度 / 弹性模量 |
+| `target_load_kn` / `load_tolerance_pct` | 目标预紧力与残余允许偏差 ±% |
+| `tensioner_id` / `tensioner_count` | 拉伸器编号 / 可同时安装数量（栓组上限） |
+| `hydraulic_area_mm2` / `max_pressure_mpa` / `max_stroke_mm` | 液压有效面积 / 能力上限 / 最大行程 |
+| `min_tool_spacing` | 相邻机具最小栓位间隔（防相撞） |
+| `load_transfer_coefficient` | 载荷转移系数 λ（残余 = 施加 × (1−λ)） |
+| `min_hold_seconds` / `pressure_sync_tolerance_pct` | 最短保压 / 组内压力同步允差 % |
+| `gauge_id` / `gauge_calibration_until` | 压力表编号与校准有效期（含当日） |
+| `stage_ratios` | 分轮比例，严格递增且末级 1.0 |
+
+**分轮换位方案**：每轮覆盖全部螺栓且每栓恰好一次；同组栓用同一泵源同步加压，
+组内任意两栓圆周间隔 ≥ 最小机具间隔，组大小 ≤ 拉伸器数量。第 r 轮候选顺序取
+交叉序列旋转 r 位后贪心分组——各轮组归属与执行次序不同（换位），卸压载荷转移
+的影响在全周均布。每轮换算设定泵压 `p_set = ρ·F_target/(1−λ)/A_h` 与预测行程
+`ΔL = F·L/(E·A)`；创建/批准/修订时逐轮预检，设定泵压超能力或预测行程超限即
+409 `tensioning_infeasible`（任何回传都不可能合格）。
+
+### 分组回传与确认
+
+`POST /tensioning-plans/{id}/approve` 冻结批准快照（修订内容不可变）后，
+`POST /tensioning-plans/{id}/round-reports` 按方案组序回传：各通道压力/活塞行程、
+保压时段与卸压次序（须恰好覆盖本组）。服务换算逐栓施加载荷
+`F = p·A_h` 与预测残余预紧力 `F_res = F·(1−λ)`。以下情形**拒绝推进、记录异常
+（anomalies）并定位栓号与原始区间**：
+
+| reason | 含义 |
+|---|---|
+| `out_of_sequence` | 跳组，返回期望组与栓号 |
+| `coverage_conflict` | 通道与计划组不符（缺栓/多栓/重复，覆盖他组栓位） |
+| `gauge_mismatch` / `calibration_expired` | 压力表不符 / 回传时刻晚于校准有效期 |
+| `hold_insufficient` | 保压时段不足冻结下限 |
+| `release_order_invalid` | 卸压次序未恰好覆盖本组 |
+| `stroke_exceeded` | 活塞行程超最大行程（机具超行程） |
+| `pressure_over_capacity` | 通道压力超拉伸器能力 |
+| `pressure_out_of_sync` | 组内压力极差/均值超同步允差（泵压正常≠各栓受力一致） |
+| `residual_out_of_tolerance` | 预测残余预紧力超当轮目标带 |
+
+被拒回传不推进进度，该组整改后重新回传。`POST /tensioning-plans/{id}/confirm`
+要求全部组回传完成且末轮逐栓残余预紧力落入目标带，否则 409 返回 `blockers`
+（`incomplete_coverage` / `residual_out_of_tolerance`）与逐栓明细。
+
+### 修订：人工改组、中断重排与采纳超声
+
+- `POST /tensioning-plans/{id}/revisions` — 人工改组/参数变化：**必须说明理由**，
+  派生新修订（revision+1，旧修订废止不覆盖）；**已完成组原位锁定，只重排未完成组**
+  （贪心分组对已完成前缀稳定，同参数重排可确定复现剩余组）；空修订拒绝。
+- `POST /tensioning-plans/{id}/adopt-ultrasonic` — 采用既有**已确认**超声批次的
+  逐栓实测载荷作为残余预紧力证据：**必须说明理由**并派生修订，快照随修订冻结；
+  确认时以实测值替代预测值（`evidence_source=ultrasonic`）。
+- `GET /tensioning-plans/{id}/diff` — 与上一修订的差异：冻结参数、逐轮分组
+  （锁定组原位保留）与超声采纳变化。
+
+批准快照、版本差异与 `GET /procedures/{id}/package` 的 `tensioning` 字段
+**共用同一张拉方案与结果**（同一详情视图：冻结参数、分轮换位方案、逐组回传
+与确认评估）。
+
 ## 版本与修订链
 
 批准后参数锁定（PUT 仅草稿可用）；目标或工具变化须
